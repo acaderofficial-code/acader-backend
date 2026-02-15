@@ -11,10 +11,26 @@ model WebhookEvent {
   id        Int      @id @default(autoincrement())
   provider  String
   event     String?
+  eventType String?  @map("event_type")
   eventId   String   @unique @map("event_id")
   reference String?
   payload   Json?
   createdAt DateTime @default(now()) @map("created_at")
+  receivedAt DateTime? @default(now()) @map("received_at")
 
   @@map("webhook_events")
+}
+
+model LedgerEntry {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId         Int?     @map("user_id")
+  amount         Decimal  @db.Decimal(12, 2)
+  direction      String
+  balanceType    String   @map("balance_type")
+  type           String?
+  reference      String?
+  idempotencyKey String   @unique @map("idempotency_key")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@map("ledger_entries")
 }

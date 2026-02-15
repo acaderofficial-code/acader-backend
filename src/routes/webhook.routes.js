@@ -1,6 +1,7 @@
 import express from "express";
 import crypto from "crypto";
 import pool from "../config/db.js";
+import { applyPaymentTransitionLedger } from "../services/ledger.service.js";
 
 const router = express.Router();
 
@@ -82,11 +83,26 @@ router.post("/paystack", async (req, res) => {
   try {
     console.log(`[${requestId}] inserting webhook_events (forensic + idempotency)`);
     const lockResult = await pool.query(
-      `INSERT INTO webhook_events (provider, event_id, event, reference, payload)
-       VALUES ($1, $2, $3, $4, $5::jsonb)
+      `INSERT INTO webhook_events (
+         provider,
+         event_id,
+         event,
+         event_type,
+         reference,
+         payload,
+         received_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW())
        ON CONFLICT (event_id) DO NOTHING
        RETURNING id`,
-      ["paystack", eventId, eventName, reference, JSON.stringify(event)],
+      [
+        "paystack",
+        eventId,
+        eventName,
+        eventName,
+        reference,
+        JSON.stringify(event),
+      ],
     );
 
     console.log(`[${requestId}] webhook_events insert result`, {
@@ -193,12 +209,15 @@ router.post("/paystack", async (req, res) => {
         disputeId = disputeInsert.rows[0]?.id ?? null;
       }
 
+      await applyPaymentTransitionLedger(client, payment, nextStatus, {
+        idempotencyPrefix: `payment:${payment.id}:${payment.status}->${nextStatus}`,
+      });
+
       const escrow =
         nextStatus === "paid"
           ? true
           : nextStatus === "released" ||
               nextStatus === "failed" ||
-              nextStatus === "transfer_failed" ||
               nextStatus === "refunded"
             ? false
             : payment.escrow;

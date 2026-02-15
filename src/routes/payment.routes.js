@@ -10,6 +10,7 @@ import {
   markPaymentAsPaidByReference,
   verifyPaystackReference,
 } from "../services/paystack.service.js";
+import { applyPaymentTransitionLedger } from "../services/ledger.service.js";
 
 const router = express.Router();
 
@@ -257,7 +258,11 @@ router.patch(
       const result = await client.query(
         `
         UPDATE payments
-        SET status = $1, escrow = $2
+        SET status = $1,
+            escrow = $2,
+            paid_at = CASE WHEN $1 = 'paid' THEN COALESCE(paid_at, NOW()) ELSE paid_at END,
+            released_at = CASE WHEN $1 = 'released' THEN NOW() ELSE released_at END,
+            refunded_at = CASE WHEN $1 = 'refunded' THEN NOW() ELSE refunded_at END
         WHERE id = $3
         RETURNING *
         `,
@@ -270,16 +275,9 @@ router.patch(
         throw new Error("Payment not found");
       }
 
-      if (status === "released") {
-        await client.query(
-          `
-          UPDATE wallets
-          SET balance = balance + $1
-          WHERE user_id = $2
-          `,
-          [updatedPayment.amount, updatedPayment.user_id],
-        );
-      }
+      await applyPaymentTransitionLedger(client, payment, status, {
+        idempotencyPrefix: `payment:${payment.id}:${payment.status}->${status}`,
+      });
 
       await client.query("COMMIT");
     } catch (err) {
@@ -410,6 +408,10 @@ router.post(
         [id, raised_by, reason ?? ""],
       );
       dispute = created.rows[0];
+
+      await applyPaymentTransitionLedger(client, pay, "disputed", {
+        idempotencyPrefix: `payment:${pay.id}:${pay.status}->disputed`,
+      });
 
       await client.query("UPDATE payments SET status='disputed' WHERE id=$1", [id]);
       await client.query(

@@ -4,6 +4,12 @@ import { safeNotify } from "../utils/notify.js";
 import { verifyToken } from "../middleware/auth.middleware.js";
 import { requireAdmin } from "../middleware/admin.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
+import {
+  createWithdrawalHold,
+  getUserBalanceByType,
+  releaseWithdrawalHold,
+  settleWithdrawal,
+} from "../services/ledger.service.js";
 
 const router = express.Router();
 
@@ -30,18 +36,22 @@ router.post(
     try {
       await client.query("BEGIN");
 
-      const wallet = await client.query(
-        "SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE",
+      const userRow = await client.query(
+        "SELECT id FROM users WHERE id = $1 FOR UPDATE",
         [user_id],
       );
 
-      if (wallet.rows.length === 0) {
+      if (userRow.rows.length === 0) {
         await client.query("ROLLBACK");
-        return res.status(404).json({ message: "Wallet not found" });
+        return res.status(404).json({ message: "User not found" });
       }
 
-      const balance = Number(wallet.rows[0].balance);
-      if (balance < normalizedAmount) {
+      const availableBalance = await getUserBalanceByType(
+        client,
+        user_id,
+        "available",
+      );
+      if (availableBalance < normalizedAmount) {
         await client.query("ROLLBACK");
         return res.status(400).json({ message: "Insufficient balance" });
       }
@@ -53,12 +63,8 @@ router.post(
         [user_id, normalizedAmount, bank_name, account_number],
       );
 
-      await client.query(
-        "UPDATE wallets SET balance = balance - $1 WHERE user_id = $2",
-        [normalizedAmount, user_id],
-      );
-
       createdWithdrawal = withdrawal.rows[0];
+      await createWithdrawalHold(client, createdWithdrawal);
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK");
@@ -118,10 +124,9 @@ router.patch(
       }
 
       if (status === "rejected") {
-        await client.query(
-          "UPDATE wallets SET balance = balance + $1 WHERE user_id = $2",
-          [withdrawal.amount, withdrawal.user_id],
-        );
+        await releaseWithdrawalHold(client, withdrawal);
+      } else if (status === "approved") {
+        await settleWithdrawal(client, withdrawal);
       }
 
       const updatedResult = await client.query(

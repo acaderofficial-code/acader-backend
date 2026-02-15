@@ -4,6 +4,7 @@ import { requireAdmin } from "../middleware/admin.js";
 import { verifyToken } from "../middleware/auth.middleware.js";
 import { safeNotify } from "../utils/notify.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
+import { applyPaymentTransitionLedger } from "../services/ledger.service.js";
 
 const router = express.Router();
 
@@ -139,7 +140,6 @@ router.patch(
       }
 
       const dispute = disputeResult.rows[0];
-      const paymentAmount = Number(dispute.payment_amount);
       paymentUserId = dispute.payment_user_id;
 
       if (dispute.status !== "open") {
@@ -154,34 +154,29 @@ router.patch(
         });
       }
 
+      const targetStatus = resolution === "release" ? "released" : "refunded";
+      const paymentForLedger = {
+        id: dispute.payment_id,
+        user_id: dispute.payment_user_id,
+        amount: dispute.payment_amount,
+        status: dispute.payment_status,
+        provider_ref: `payment:${dispute.payment_id}`,
+      };
+
+      await applyPaymentTransitionLedger(client, paymentForLedger, targetStatus, {
+        idempotencyPrefix: `payment:${dispute.payment_id}:${dispute.payment_status}->${targetStatus}`,
+      });
+
       if (resolution === "release") {
         await client.query(
-          "UPDATE payments SET status = 'released', escrow = false WHERE id = $1",
+          "UPDATE payments SET status = 'released', escrow = false, released_at = NOW() WHERE id = $1",
           [dispute.payment_id],
-        );
-        await client.query(
-          "UPDATE wallets SET balance = balance + $1 WHERE user_id = $2",
-          [paymentAmount, paymentUserId],
         );
       }
 
       if (resolution === "refund") {
-        const walletDebit = await client.query(
-          `UPDATE wallets
-           SET balance = balance - $1
-           WHERE user_id = $2 AND balance >= $1
-           RETURNING id`,
-          [paymentAmount, paymentUserId],
-        );
-        if (walletDebit.rowCount === 0) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({
-            message: "Cannot refund: insufficient wallet balance for reversal",
-          });
-        }
-
         await client.query(
-          "UPDATE payments SET status = 'refunded', escrow = false WHERE id = $1",
+          "UPDATE payments SET status = 'refunded', escrow = false, refunded_at = NOW() WHERE id = $1",
           [dispute.payment_id],
         );
       }

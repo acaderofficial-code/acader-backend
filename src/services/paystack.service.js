@@ -1,5 +1,6 @@
 import axios from "axios";
 import pool from "../config/db.js";
+import { applyPaymentTransitionLedger } from "./ledger.service.js";
 
 export const verifyPaystackReference = async (reference) => {
   const secret = process.env.PAYSTACK_SECRET_KEY;
@@ -33,38 +34,62 @@ export const markPaymentAsPaidByReference = async (
   options = {},
 ) => {
   const { enforceUserId } = options;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
-  const existing = await pool.query(
-    "SELECT * FROM payments WHERE provider_ref = $1",
-    [reference],
-  );
+    const existing = await client.query(
+      "SELECT * FROM payments WHERE provider_ref = $1 FOR UPDATE",
+      [reference],
+    );
 
-  if (existing.rows.length === 0) {
-    const err = new Error("Payment record not found");
-    err.status = 404;
-    throw err;
+    if (existing.rows.length === 0) {
+      await client.query("ROLLBACK");
+      const err = new Error("Payment record not found");
+      err.status = 404;
+      throw err;
+    }
+
+    const payment = existing.rows[0];
+    if (enforceUserId && payment.user_id !== enforceUserId) {
+      await client.query("ROLLBACK");
+      const err = new Error("Forbidden");
+      err.status = 403;
+      throw err;
+    }
+
+    if (payment.status === "paid" || payment.status === "released") {
+      await client.query("COMMIT");
+      return { payment, updated: false };
+    }
+
+    const updated = await client.query(
+      `UPDATE payments
+       SET status = 'paid', escrow = true, paid_at = COALESCE(paid_at, NOW())
+       WHERE id = $1
+       RETURNING *`,
+      [payment.id],
+    );
+
+    const updatedPayment = updated.rows[0];
+
+    await applyPaymentTransitionLedger(client, payment, "paid", {
+      idempotencyPrefix: `payment:${payment.id}:${payment.status}->paid`,
+    });
+
+    await client.query("COMMIT");
+
+    console.log("💰 Escrow locked for payment:", reference);
+
+    return { payment: updatedPayment, updated: true };
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      // ignore rollback failure
+    }
+    throw error;
+  } finally {
+    client.release();
   }
-
-  const payment = existing.rows[0];
-  if (enforceUserId && payment.user_id !== enforceUserId) {
-    const err = new Error("Forbidden");
-    err.status = 403;
-    throw err;
-  }
-
-  if (payment.status === "paid" || payment.status === "released") {
-    return { payment, updated: false };
-  }
-
-  const updated = await pool.query(
-    `UPDATE payments
-     SET status = 'paid', escrow = true, paid_at = COALESCE(paid_at, NOW())
-     WHERE id = $1
-     RETURNING *`,
-    [payment.id],
-  );
-
-  console.log("💰 Escrow locked for payment:", reference);
-
-  return { payment: updated.rows[0], updated: true };
 };
