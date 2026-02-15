@@ -212,7 +212,30 @@ export const applyPaymentTransitionLedger = async (
   const reference = payment.provider_ref ?? `payment:${payment.id}`;
   const idempotencyPrefix =
     options.idempotencyPrefix ?? `payment:${payment.id}:${fromStatus}->${nextStatus}`;
-  const userId = payment.user_id;
+  const companyUserRaw = options.companyUserId ?? payment.company_user_id;
+  const companyUserId = Number(companyUserRaw);
+  if (!Number.isInteger(companyUserId) || companyUserId <= 0) {
+    throw new Error("Invalid company user id for payment ledger transition");
+  }
+
+  const studentUserRaw = options.studentUserId ?? payment.student_user_id;
+  const parsedStudentUserId = Number(studentUserRaw);
+  const hasExplicitStudentUserId =
+    Number.isInteger(parsedStudentUserId) && parsedStudentUserId > 0;
+  const studentUserId = hasExplicitStudentUserId ? parsedStudentUserId : null;
+  const disputedFundsUserId =
+    payment.escrow === true ? companyUserId : studentUserId;
+
+  const ensureStudentRecipient = () => {
+    if (options.requireStudentUserId && !hasExplicitStudentUserId) {
+      throw new Error("Student user id is required for this transition");
+    }
+  };
+  const ensureDisputedFundsOwner = () => {
+    if (!Number.isInteger(disputedFundsUserId) || disputedFundsUserId <= 0) {
+      throw new Error("Invalid disputed funds owner for payment ledger transition");
+    }
+  };
   const walletUserIds = [];
 
   const run = async (config) => {
@@ -231,7 +254,11 @@ export const applyPaymentTransitionLedger = async (
     return result;
   };
 
-  const applyPlatformFee = async () => {
+  const applyPlatformFee = async (feePayerUserId) => {
+    if (!Number.isInteger(feePayerUserId) || feePayerUserId <= 0) {
+      return false;
+    }
+
     const feePercent = getPlatformFeePercent();
     if (feePercent <= 0) {
       return false;
@@ -247,7 +274,7 @@ export const applyPaymentTransitionLedger = async (
       reference,
       idempotencyBase: `${idempotencyPrefix}:platform_fee`,
       type: "fee",
-      debitUserId: userId,
+      debitUserId: feePayerUserId,
       debitBalanceType: BALANCE_TYPE.AVAILABLE,
       creditUserId: null,
       creditBalanceType: BALANCE_TYPE.PLATFORM,
@@ -265,81 +292,87 @@ export const applyPaymentTransitionLedger = async (
         type: "escrow_hold",
         debitUserId: null,
         debitBalanceType: BALANCE_TYPE.PLATFORM,
-        creditUserId: userId,
+        creditUserId: companyUserId,
         creditBalanceType: BALANCE_TYPE.ESCROW,
       });
       break;
     case "paid->released":
+      ensureStudentRecipient();
       result = await run({
         kind: "release",
         type: "release",
-        debitUserId: userId,
+        debitUserId: companyUserId,
         debitBalanceType: BALANCE_TYPE.ESCROW,
-        creditUserId: userId,
+        creditUserId: studentUserId,
         creditBalanceType: BALANCE_TYPE.AVAILABLE,
       });
-      await applyPlatformFee();
-      walletUserIds.push(userId);
+      await applyPlatformFee(studentUserId);
+      walletUserIds.push(companyUserId, studentUserId);
       break;
     case "released->disputed":
+      ensureStudentRecipient();
       result = await run({
         kind: "dispute_hold",
         type: "dispute_hold",
-        debitUserId: userId,
+        debitUserId: studentUserId,
         debitBalanceType: BALANCE_TYPE.AVAILABLE,
-        creditUserId: userId,
+        creditUserId: studentUserId,
         creditBalanceType: BALANCE_TYPE.LOCKED,
       });
-      walletUserIds.push(userId);
+      walletUserIds.push(studentUserId);
       break;
     case "paid->disputed":
       result = await run({
         kind: "dispute_hold",
         type: "dispute_hold",
-        debitUserId: userId,
+        debitUserId: companyUserId,
         debitBalanceType: BALANCE_TYPE.ESCROW,
-        creditUserId: userId,
+        creditUserId: companyUserId,
         creditBalanceType: BALANCE_TYPE.LOCKED,
       });
       break;
     case "disputed->released":
+      ensureStudentRecipient();
+      ensureDisputedFundsOwner();
       result = await run({
         kind: "dispute_release",
         type: "release",
-        debitUserId: userId,
+        debitUserId: disputedFundsUserId,
         debitBalanceType: BALANCE_TYPE.LOCKED,
-        creditUserId: userId,
+        creditUserId: studentUserId,
         creditBalanceType: BALANCE_TYPE.AVAILABLE,
       });
-      await applyPlatformFee();
-      walletUserIds.push(userId);
+      await applyPlatformFee(studentUserId);
+      walletUserIds.push(disputedFundsUserId, studentUserId);
       break;
     case "paid->refunded":
       result = await run({
         kind: "refund",
         type: "refund",
-        debitUserId: userId,
+        debitUserId: companyUserId,
         debitBalanceType: BALANCE_TYPE.ESCROW,
         creditUserId: null,
         creditBalanceType: BALANCE_TYPE.PLATFORM,
       });
       break;
     case "released->refunded":
+      ensureStudentRecipient();
       result = await run({
         kind: "refund",
         type: "refund",
-        debitUserId: userId,
+        debitUserId: studentUserId,
         debitBalanceType: BALANCE_TYPE.AVAILABLE,
         creditUserId: null,
         creditBalanceType: BALANCE_TYPE.PLATFORM,
       });
-      walletUserIds.push(userId);
+      walletUserIds.push(studentUserId);
       break;
     case "disputed->refunded":
+      ensureDisputedFundsOwner();
       result = await run({
         kind: "refund",
         type: "refund",
-        debitUserId: userId,
+        debitUserId: disputedFundsUserId,
         debitBalanceType: BALANCE_TYPE.LOCKED,
         creditUserId: null,
         creditBalanceType: BALANCE_TYPE.PLATFORM,

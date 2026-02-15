@@ -202,6 +202,29 @@ router.patch(
     const payment = current.rows[0];
     const currentStatus = payment.status;
     let escrow = payment.escrow;
+    let companyUserId = null;
+    let studentUserId = null;
+
+    const parties = await pool.query(
+      `
+      SELECT c.user_id AS company_user_id, a.user_id AS student_user_id
+      FROM payments pay
+      LEFT JOIN companies c ON c.id = pay.company_id
+      LEFT JOIN applications a ON a.id = pay.application_id
+      WHERE pay.id = $1
+      `,
+      [id],
+    );
+    if (parties.rows.length > 0) {
+      const parsedCompanyUserId = Number(parties.rows[0].company_user_id);
+      const parsedStudentUserId = Number(parties.rows[0].student_user_id);
+      if (Number.isInteger(parsedCompanyUserId) && parsedCompanyUserId > 0) {
+        companyUserId = parsedCompanyUserId;
+      }
+      if (Number.isInteger(parsedStudentUserId) && parsedStudentUserId > 0) {
+        studentUserId = parsedStudentUserId;
+      }
+    }
 
     const transitions = {
       pending: ["paid"],
@@ -220,7 +243,7 @@ router.patch(
     if (status === "released") {
       const check = await pool.query(
         `
-        SELECT p.status AS project_status, a.status AS application_status
+        SELECT p.status AS project_status, a.status AS application_status, a.user_id AS student_user_id
         FROM payments pay
         JOIN projects p ON pay.project_id = p.id
         JOIN applications a ON pay.application_id = a.id
@@ -236,6 +259,11 @@ router.patch(
       }
 
       const { project_status, application_status } = check.rows[0];
+      const parsedStudentUserId = Number(check.rows[0].student_user_id);
+
+      if (!Number.isInteger(parsedStudentUserId) || parsedStudentUserId <= 0) {
+        return res.status(400).json({ message: "Invalid student for release" });
+      }
 
       if (project_status !== "completed") {
         return res.status(400).json({ message: "Project not completed" });
@@ -244,6 +272,8 @@ router.patch(
       if (application_status !== "accepted") {
         return res.status(400).json({ message: "Application not accepted" });
       }
+
+      studentUserId = parsedStudentUserId;
     }
 
     if (status === "paid") escrow = true;
@@ -277,6 +307,9 @@ router.patch(
 
       await applyPaymentTransitionLedger(client, payment, status, {
         idempotencyPrefix: `payment:${payment.id}:${payment.status}->${status}`,
+        companyUserId: companyUserId ?? undefined,
+        studentUserId: studentUserId ?? undefined,
+        requireStudentUserId: status === "released",
       });
 
       await client.query("COMMIT");
@@ -297,8 +330,9 @@ router.patch(
     }
 
     if (status === "released") {
+      const recipientUserId = studentUserId ?? updatedPayment.user_id;
       await safeNotify(
-        updatedPayment.user_id,
+        recipientUserId,
         "payment_released",
         "Your payment has been released to your wallet.",
         id,
@@ -306,7 +340,7 @@ router.patch(
 
       const userResult = await pool.query(
         "SELECT email FROM users WHERE id = $1",
-        [updatedPayment.user_id],
+        [recipientUserId],
       );
       const user = userResult.rows[0];
 
@@ -408,9 +442,29 @@ router.post(
         [id, raised_by, reason ?? ""],
       );
       dispute = created.rows[0];
+      const partiesInTx = await client.query(
+        `
+        SELECT c.user_id AS company_user_id, a.user_id AS student_user_id
+        FROM payments pay
+        LEFT JOIN companies c ON c.id = pay.company_id
+        LEFT JOIN applications a ON a.id = pay.application_id
+        WHERE pay.id = $1
+        `,
+        [id],
+      );
+      const companyUserIdInTx = Number(partiesInTx.rows[0]?.company_user_id);
+      const studentUserIdInTx = Number(partiesInTx.rows[0]?.student_user_id);
 
       await applyPaymentTransitionLedger(client, pay, "disputed", {
         idempotencyPrefix: `payment:${pay.id}:${pay.status}->disputed`,
+        companyUserId:
+          Number.isInteger(companyUserIdInTx) && companyUserIdInTx > 0
+            ? companyUserIdInTx
+            : undefined,
+        studentUserId:
+          Number.isInteger(studentUserIdInTx) && studentUserIdInTx > 0
+            ? studentUserIdInTx
+            : undefined,
       });
 
       await client.query("UPDATE payments SET status='disputed' WHERE id=$1", [id]);

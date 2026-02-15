@@ -164,7 +164,12 @@ router.post("/paystack", async (req, res) => {
 
       console.log(`[${requestId}] selecting payment by provider_ref`);
       const paymentResult = await client.query(
-        "SELECT * FROM payments WHERE provider_ref = $1 FOR UPDATE",
+        `SELECT p.*, a.user_id AS student_user_id, c.user_id AS company_user_id
+         FROM payments p
+         LEFT JOIN applications a ON a.id = p.application_id
+         LEFT JOIN companies c ON c.id = p.company_id
+         WHERE p.provider_ref = $1
+         FOR UPDATE OF p`,
         [reference],
       );
 
@@ -185,6 +190,18 @@ router.post("/paystack", async (req, res) => {
           reference,
         });
         return res.sendStatus(200);
+      }
+
+      if (eventName === "transfer.success") {
+        const studentUserId = Number(payment.student_user_id);
+        if (!Number.isInteger(studentUserId) || studentUserId <= 0) {
+          await client.query("ROLLBACK");
+          console.error(
+            `[${requestId}] transfer.success ignored: missing student user mapping`,
+            { paymentId: payment.id, applicationId: payment.application_id, reference },
+          );
+          return res.sendStatus(200);
+        }
       }
 
       let disputeId = null;
@@ -211,6 +228,9 @@ router.post("/paystack", async (req, res) => {
 
       await applyPaymentTransitionLedger(client, payment, nextStatus, {
         idempotencyPrefix: `payment:${payment.id}:${payment.status}->${nextStatus}`,
+        companyUserId: payment.company_user_id ?? undefined,
+        studentUserId: payment.student_user_id ?? undefined,
+        requireStudentUserId: eventName === "transfer.success",
       });
 
       const escrow =
@@ -267,9 +287,17 @@ router.post("/paystack", async (req, res) => {
       }
 
       const updatedRow = updateResult.rows[0] ?? {};
+      const transferRecipientId =
+        eventName === "transfer.success" ? Number(payment.student_user_id) : null;
+      const notificationUserId =
+        Number.isInteger(transferRecipientId) && transferRecipientId > 0
+          ? transferRecipientId
+          : updatedRow.user_id;
+
       updatedPayment = {
         ...updatedRow,
         dispute_id: disputeId,
+        notification_user_id: notificationUserId,
       };
 
       await client.query("COMMIT");
@@ -310,7 +338,8 @@ router.post("/paystack", async (req, res) => {
   }
 
   // 5) Non-critical side effects: notification must never rollback payment update.
-  if (updatedPayment?.user_id) {
+  const notificationUserId = updatedPayment?.notification_user_id ?? updatedPayment?.user_id;
+  if (notificationUserId) {
     const notificationByEvent = {
       "charge.success": {
         title: "Payment successful",
@@ -352,7 +381,7 @@ router.post("/paystack", async (req, res) => {
           `INSERT INTO notifications (user_id, title, message, type, related_id)
            VALUES ($1, $2, $3, $4, $5)`,
           [
-            updatedPayment.user_id,
+            notificationUserId,
             n.title,
             n.message,
             n.type,

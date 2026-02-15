@@ -39,7 +39,12 @@ export const markPaymentAsPaidByReference = async (
     await client.query("BEGIN");
 
     const existing = await client.query(
-      "SELECT * FROM payments WHERE provider_ref = $1 FOR UPDATE",
+      `SELECT p.*, c.user_id AS company_user_id, a.user_id AS student_user_id
+       FROM payments p
+       LEFT JOIN companies c ON c.id = p.company_id
+       LEFT JOIN applications a ON a.id = p.application_id
+       WHERE p.provider_ref = $1
+       FOR UPDATE OF p`,
       [reference],
     );
 
@@ -75,6 +80,8 @@ export const markPaymentAsPaidByReference = async (
 
     await applyPaymentTransitionLedger(client, payment, "paid", {
       idempotencyPrefix: `payment:${payment.id}:${payment.status}->paid`,
+      companyUserId: payment.company_user_id ?? undefined,
+      studentUserId: payment.student_user_id ?? undefined,
     });
 
     await client.query("COMMIT");

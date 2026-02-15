@@ -338,11 +338,21 @@ router.patch(
 
       const disputeResult = await client.query(
         `
-        SELECT d.*, p.id as payment_id, p.status as payment_status, p.amount as payment_amount, p.user_id as payment_user_id
+        SELECT
+          d.*,
+          p.id as payment_id,
+          p.status as payment_status,
+          p.amount as payment_amount,
+          p.user_id as payment_user_id,
+          p.application_id as payment_application_id,
+          a.user_id as student_user_id,
+          c.user_id as company_user_id
         FROM disputes d
         JOIN payments p ON d.payment_id = p.id
+        LEFT JOIN applications a ON a.id = p.application_id
+        LEFT JOIN companies c ON c.id = p.company_id
         WHERE d.id = $1
-        FOR UPDATE
+        FOR UPDATE OF d, p
         `,
         [id],
       );
@@ -378,6 +388,9 @@ router.patch(
 
       await applyPaymentTransitionLedger(client, paymentForLedger, targetStatus, {
         idempotencyPrefix: `payment:${dispute.payment_id}:${dispute.payment_status}->${targetStatus}`,
+        companyUserId: dispute.company_user_id ?? undefined,
+        studentUserId: dispute.student_user_id ?? undefined,
+        requireStudentUserId: targetStatus === "released",
       });
 
       if (resolution === "release") {
