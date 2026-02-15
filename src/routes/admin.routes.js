@@ -100,6 +100,219 @@ router.get(
 );
 
 /**
+ * Ledger report (admin only)
+ * GET /api/admin/reports/ledger
+ * Query params:
+ * - user_id
+ * - balance_type: available|escrow|locked|platform
+ * - type
+ * - reference (partial match)
+ * - from (ISO date)
+ * - to (ISO date)
+ * - limit (default 100, max 500)
+ * - offset (default 0)
+ * - per_user_limit (default 200, max 1000)
+ */
+router.get(
+  "/reports/ledger",
+  asyncHandler(async (req, res) => {
+    const {
+      user_id,
+      balance_type,
+      type,
+      reference,
+      from,
+      to,
+      limit = "100",
+      offset = "0",
+      per_user_limit = "200",
+    } = req.query;
+
+    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+    const parsedOffset = Math.max(parseInt(offset, 10) || 0, 0);
+    const parsedPerUserLimit = Math.min(
+      Math.max(parseInt(per_user_limit, 10) || 200, 1),
+      1000,
+    );
+
+    const allowedBalanceTypes = ["available", "escrow", "locked", "platform"];
+    const filters = [];
+    const values = [];
+
+    let parsedUserId;
+    if (user_id !== undefined) {
+      parsedUserId = parseInt(user_id, 10);
+      if (Number.isNaN(parsedUserId) || parsedUserId <= 0) {
+        return res.status(400).json({ message: "Invalid user_id" });
+      }
+      values.push(parsedUserId);
+      filters.push(`le.user_id = $${values.length}`);
+    }
+
+    if (balance_type !== undefined) {
+      if (!allowedBalanceTypes.includes(balance_type)) {
+        return res.status(400).json({
+          message: "Invalid balance_type. Use available|escrow|locked|platform",
+        });
+      }
+      values.push(balance_type);
+      filters.push(`le.balance_type = $${values.length}`);
+    }
+
+    if (type !== undefined) {
+      values.push(type);
+      filters.push(`le.type = $${values.length}`);
+    }
+
+    if (reference !== undefined) {
+      values.push(`%${reference}%`);
+      filters.push(`le.reference ILIKE $${values.length}`);
+    }
+
+    let fromIso;
+    if (from !== undefined) {
+      const parsed = new Date(from);
+      if (Number.isNaN(parsed.getTime())) {
+        return res.status(400).json({ message: "Invalid from date" });
+      }
+      fromIso = parsed.toISOString();
+      values.push(fromIso);
+      filters.push(`le.created_at >= $${values.length}`);
+    }
+
+    let toIso;
+    if (to !== undefined) {
+      const parsed = new Date(to);
+      if (Number.isNaN(parsed.getTime())) {
+        return res.status(400).json({ message: "Invalid to date" });
+      }
+      toIso = parsed.toISOString();
+      values.push(toIso);
+      filters.push(`le.created_at <= $${values.length}`);
+    }
+
+    const whereClause = filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const summaryQuery = `
+      SELECT
+        COALESCE(SUM(CASE WHEN le.direction = 'credit' THEN le.amount ELSE 0 END), 0) AS total_credits,
+        COALESCE(SUM(CASE WHEN le.direction = 'debit' THEN le.amount ELSE 0 END), 0) AS total_debits,
+        COALESCE(SUM(CASE WHEN le.direction = 'credit' THEN le.amount WHEN le.direction = 'debit' THEN -le.amount ELSE 0 END), 0) AS net_change
+      FROM ledger_entries le
+      ${whereClause}
+    `;
+
+    const countQuery = `
+      SELECT COUNT(*)::int AS total_count
+      FROM ledger_entries le
+      ${whereClause}
+    `;
+
+    const entriesQuery = `
+      SELECT
+        le.id,
+        le.user_id,
+        u.email,
+        le.amount,
+        le.direction,
+        le.balance_type,
+        le.type,
+        le.reference,
+        le.idempotency_key,
+        le.created_at
+      FROM ledger_entries le
+      LEFT JOIN users u ON u.id = le.user_id
+      ${whereClause}
+      ORDER BY le.created_at DESC
+      LIMIT $${values.length + 1}
+      OFFSET $${values.length + 2}
+    `;
+
+    const platformFilters = ["balance_type = 'platform'"];
+    const platformValues = [];
+    if (toIso) {
+      platformValues.push(toIso);
+      platformFilters.push(`created_at <= $${platformValues.length}`);
+    }
+    const platformWhere = `WHERE ${platformFilters.join(" AND ")}`;
+
+    const platformQuery = `
+      SELECT
+        COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount ELSE 0 END), 0) AS total_credits,
+        COALESCE(SUM(CASE WHEN direction = 'debit' THEN amount ELSE 0 END), 0) AS total_debits,
+        COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount WHEN direction = 'debit' THEN -amount ELSE 0 END), 0) AS balance
+      FROM ledger_entries
+      ${platformWhere}
+    `;
+
+    const perUserValues = [];
+    const perUserFilters = ["le.user_id IS NOT NULL"];
+    if (parsedUserId) {
+      perUserValues.push(parsedUserId);
+      perUserFilters.push(`le.user_id = $${perUserValues.length}`);
+    }
+    if (toIso) {
+      perUserValues.push(toIso);
+      perUserFilters.push(`le.created_at <= $${perUserValues.length}`);
+    }
+    perUserValues.push(parsedPerUserLimit);
+
+    const perUserQuery = `
+      SELECT
+        le.user_id,
+        u.email,
+        COALESCE(SUM(CASE WHEN le.balance_type = 'available' AND le.direction = 'credit' THEN le.amount
+                          WHEN le.balance_type = 'available' AND le.direction = 'debit' THEN -le.amount
+                          ELSE 0 END), 0) AS available_balance,
+        COALESCE(SUM(CASE WHEN le.balance_type = 'escrow' AND le.direction = 'credit' THEN le.amount
+                          WHEN le.balance_type = 'escrow' AND le.direction = 'debit' THEN -le.amount
+                          ELSE 0 END), 0) AS escrow_balance,
+        COALESCE(SUM(CASE WHEN le.balance_type = 'locked' AND le.direction = 'credit' THEN le.amount
+                          WHEN le.balance_type = 'locked' AND le.direction = 'debit' THEN -le.amount
+                          ELSE 0 END), 0) AS locked_balance,
+        COALESCE(SUM(CASE WHEN le.direction = 'credit' THEN le.amount
+                          WHEN le.direction = 'debit' THEN -le.amount
+                          ELSE 0 END), 0) AS net_balance
+      FROM ledger_entries le
+      LEFT JOIN users u ON u.id = le.user_id
+      WHERE ${perUserFilters.join(" AND ")}
+      GROUP BY le.user_id, u.email
+      ORDER BY le.user_id ASC
+      LIMIT $${perUserValues.length}
+    `;
+
+    const [summaryResult, countResult, entriesResult, platformResult, perUserResult] =
+      await Promise.all([
+        pool.query(summaryQuery, values),
+        pool.query(countQuery, values),
+        pool.query(entriesQuery, [...values, parsedLimit, parsedOffset]),
+        pool.query(platformQuery, platformValues),
+        pool.query(perUserQuery, perUserValues),
+      ]);
+
+    res.json({
+      filters: {
+        user_id: parsedUserId ?? null,
+        balance_type: balance_type ?? null,
+        type: type ?? null,
+        reference: reference ?? null,
+        from: fromIso ?? null,
+        to: toIso ?? null,
+      },
+      pagination: {
+        limit: parsedLimit,
+        offset: parsedOffset,
+        total: countResult.rows[0]?.total_count ?? 0,
+      },
+      summary: summaryResult.rows[0],
+      platform_balance: platformResult.rows[0],
+      per_user_balances: perUserResult.rows,
+      entries: entriesResult.rows,
+    });
+  }),
+);
+
+/**
  * Admin resolves dispute
  */
 router.patch(
