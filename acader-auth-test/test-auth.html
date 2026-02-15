@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Acader Firebase Auth Test</title>
+</head>
+<body>
+  <h2>Firebase Auth Test</h2>
+
+  <button onclick="signUp()">Sign Up</button>
+  <button onclick="logIn()">Login</button>
+  <button onclick="getToken()">Get ID Token</button>
+
+  <pre id="out"></pre>
+
+  <!-- Firebase CDN SDK -->
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+
+  <script>
+    const firebaseConfig = {
+      apiKey: "AIzaSyBQCxM2XsPSMQ--pgcydLepV1EXwr8GKl8",
+      authDomain: "acader-project.firebaseapp.com",
+      projectId: "acader-project",
+      storageBucket: "acader-project.firebasestorage.app",
+      messagingSenderId: "939997981066",
+      appId: "1:939997981066:web:bd74b2e8e72c38a9370073",
+      measurementId: "G-LZSNET9TMT"
+    };
+
+    firebase.initializeApp(firebaseConfig);
+    const auth = firebase.auth();
+
+    function signUp() {
+      auth.createUserWithEmailAndPassword("test@acader.com", "123456")
+        .then(res => out("Signed up"))
+        .catch(e => out(e.message));
+    }
+
+    function logIn() {
+      auth.signInWithEmailAndPassword("test@acader.com", "123456")
+        .then(res => out("Logged in"))
+        .catch(e => out(e.message));
+    }
+
+    async function getToken() {
+      const user = auth.currentUser;
+      if (!user) return out("No user logged in");
+      const token = await user.getIdToken();
+      out(token);
+    }
+
+    function out(msg) {
+      document.getElementById("out").innerText = msg;
+    }
+  </script>
+</body>
+</html>

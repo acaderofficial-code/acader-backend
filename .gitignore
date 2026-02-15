@@ -1,3 +1,5 @@
 node_modules/
+firebaseServiceAccount.json
+src/config/firebaseServiceAccount.json
 .env
 .DS_Store
