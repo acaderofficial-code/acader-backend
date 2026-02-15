@@ -104,7 +104,7 @@ router.get(
  * GET /api/admin/reports/ledger
  * Query params:
  * - user_id
- * - balance_type: available|escrow|locked|platform|revenue
+ * - balance_type: available|escrow|locked|platform|revenue|payout
  * - type
  * - reference (partial match)
  * - from (ISO date)
@@ -141,6 +141,7 @@ router.get(
       "locked",
       "platform",
       "revenue",
+      "payout",
     ];
     const filters = [];
     const values = [];
@@ -159,7 +160,7 @@ router.get(
       if (!allowedBalanceTypes.includes(balance_type)) {
         return res.status(400).json({
           message:
-            "Invalid balance_type. Use available|escrow|locked|platform|revenue",
+            "Invalid balance_type. Use available|escrow|locked|platform|revenue|payout",
         });
       }
       values.push(balance_type);
@@ -297,6 +298,9 @@ router.get(
         COALESCE(SUM(CASE WHEN le.balance_type = 'revenue' AND le.direction = 'credit' THEN le.amount
                           WHEN le.balance_type = 'revenue' AND le.direction = 'debit' THEN -le.amount
                           ELSE 0 END), 0) AS revenue_balance,
+        COALESCE(SUM(CASE WHEN le.balance_type = 'payout' AND le.direction = 'credit' THEN le.amount
+                          WHEN le.balance_type = 'payout' AND le.direction = 'debit' THEN -le.amount
+                          ELSE 0 END), 0) AS payout_balance,
         COALESCE(SUM(CASE WHEN le.direction = 'credit' THEN le.amount
                           WHEN le.direction = 'debit' THEN -le.amount
                           ELSE 0 END), 0) AS net_balance

@@ -8,7 +8,6 @@ import {
   createWithdrawalHold,
   getUserBalanceByType,
   releaseWithdrawalHold,
-  settleWithdrawal,
 } from "../services/ledger.service.js";
 
 const router = express.Router();
@@ -64,6 +63,15 @@ router.post(
       );
 
       createdWithdrawal = withdrawal.rows[0];
+      const providerRef = `withdrawal_${createdWithdrawal.id}`;
+      const withReference = await client.query(
+        `UPDATE withdrawals
+         SET provider_ref = COALESCE(provider_ref, $1)
+         WHERE id = $2
+         RETURNING *`,
+        [providerRef, createdWithdrawal.id],
+      );
+      createdWithdrawal = withReference.rows[0] ?? createdWithdrawal;
       await createWithdrawalHold(client, createdWithdrawal);
       await client.query("COMMIT");
     } catch (err) {
@@ -88,17 +96,18 @@ router.patch(
   verifyToken,
   requireAdmin,
   asyncHandler(async (req, res) => {
-    const { status } = req.body;
+    const { status, reason } = req.body;
     const id = parseInt(req.params.id, 10);
 
     if (Number.isNaN(id)) {
       return res.status(400).json({ message: "Invalid withdrawal id" });
     }
 
-    const allowed = ["approved", "rejected"];
+    const allowed = ["approved", "processing", "rejected"];
     if (!allowed.includes(status)) {
       return res.status(400).json({ message: "Invalid status" });
     }
+    const targetStatus = status === "approved" ? "processing" : status;
 
     const client = await pool.connect();
     let withdrawal;
@@ -123,16 +132,29 @@ router.patch(
         return res.status(400).json({ message: "Already processed" });
       }
 
-      if (status === "rejected") {
-        await releaseWithdrawalHold(client, withdrawal);
-      } else if (status === "approved") {
-        await settleWithdrawal(client, withdrawal);
+      if (targetStatus === "rejected") {
+        await releaseWithdrawalHold(client, withdrawal, {
+          reversalType: "withdrawal_reversal",
+          idempotencySuffix: "reverse",
+        });
       }
 
-      const updatedResult = await client.query(
-        `UPDATE withdrawals SET status = $1, processed_at = NOW() WHERE id = $2 RETURNING *`,
-        [status, id],
-      );
+      const updatedResult =
+        targetStatus === "processing"
+          ? await client.query(
+              `UPDATE withdrawals
+               SET status = 'processing', processed_at = NULL, failure_reason = NULL
+               WHERE id = $1
+               RETURNING *`,
+              [id],
+            )
+          : await client.query(
+              `UPDATE withdrawals
+               SET status = 'rejected', processed_at = NOW(), failure_reason = COALESCE($1, failure_reason, 'Rejected by admin')
+               WHERE id = $2
+               RETURNING *`,
+              [reason ?? null, id],
+            );
 
       updated = updatedResult.rows[0];
       await client.query("COMMIT");
@@ -143,15 +165,15 @@ router.patch(
       client.release();
     }
 
-    if (status === "approved") {
+    if (targetStatus === "processing") {
       await safeNotify(
         withdrawal.user_id,
-        "withdrawal_approved",
-        "Your withdrawal has been approved and is being processed.",
+        "withdrawal_processing",
+        "Your withdrawal has been approved and moved to processing.",
         updated.id,
       );
     }
-    if (status === "rejected") {
+    if (targetStatus === "rejected") {
       await safeNotify(
         withdrawal.user_id,
         "withdrawal_rejected",
@@ -161,7 +183,7 @@ router.patch(
     }
 
     res.json({
-      message: `Withdrawal ${status}`,
+      message: `Withdrawal ${targetStatus}`,
       withdrawal: updated,
     });
   }),

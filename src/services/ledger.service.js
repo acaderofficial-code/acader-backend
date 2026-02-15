@@ -11,6 +11,7 @@ const BALANCE_TYPE = {
   LOCKED: "locked",
   PLATFORM: "platform",
   REVENUE: "revenue",
+  PAYOUT: "payout",
 };
 
 const toPositiveAmount = (value) => {
@@ -462,10 +463,11 @@ export const applyPaymentTransitionLedger = async (
 export const createWithdrawalHold = async (client, withdrawal) => {
   const amount = toPositiveAmount(withdrawal.amount);
   const userId = withdrawal.user_id;
+  const reference = `withdrawal_${withdrawal.id}`;
   const result = await createDoubleEntry(client, {
     amount,
     type: "withdrawal_hold",
-    reference: `withdrawal:${withdrawal.id}`,
+    reference,
     idempotencyBase: `withdrawal:${withdrawal.id}:hold`,
     debitUserId: userId,
     debitBalanceType: BALANCE_TYPE.AVAILABLE,
@@ -477,14 +479,23 @@ export const createWithdrawalHold = async (client, withdrawal) => {
   return result;
 };
 
-export const releaseWithdrawalHold = async (client, withdrawal) => {
+export const releaseWithdrawalHold = async (
+  client,
+  withdrawal,
+  options = {},
+) => {
+  const {
+    reversalType = "withdrawal_reversal",
+    idempotencySuffix = "reverse",
+  } = options;
   const amount = toPositiveAmount(withdrawal.amount);
   const userId = withdrawal.user_id;
+  const reference = `withdrawal_${withdrawal.id}`;
   const result = await createDoubleEntry(client, {
     amount,
-    type: "withdrawal_release",
-    reference: `withdrawal:${withdrawal.id}`,
-    idempotencyBase: `withdrawal:${withdrawal.id}:release`,
+    type: reversalType,
+    reference,
+    idempotencyBase: `withdrawal:${withdrawal.id}:${idempotencySuffix}`,
     debitUserId: userId,
     debitBalanceType: BALANCE_TYPE.LOCKED,
     creditUserId: userId,
@@ -499,13 +510,13 @@ export const settleWithdrawal = async (client, withdrawal) => {
   const amount = toPositiveAmount(withdrawal.amount);
   return createDoubleEntry(client, {
     amount,
-    type: "withdrawal",
-    reference: `withdrawal:${withdrawal.id}`,
-    idempotencyBase: `withdrawal:${withdrawal.id}:settle`,
+    type: "withdrawal_complete",
+    reference: `withdrawal_${withdrawal.id}`,
+    idempotencyBase: `withdrawal:${withdrawal.id}:complete`,
     debitUserId: withdrawal.user_id,
     debitBalanceType: BALANCE_TYPE.LOCKED,
-    creditUserId: null,
-    creditBalanceType: BALANCE_TYPE.PLATFORM,
+    creditUserId: withdrawal.user_id,
+    creditBalanceType: BALANCE_TYPE.PAYOUT,
   });
 };
 

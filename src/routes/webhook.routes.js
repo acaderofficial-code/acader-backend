@@ -1,9 +1,144 @@
 import express from "express";
 import crypto from "crypto";
 import pool from "../config/db.js";
-import { applyPaymentTransitionLedger } from "../services/ledger.service.js";
+import {
+  applyPaymentTransitionLedger,
+  releaseWithdrawalHold,
+  settleWithdrawal,
+} from "../services/ledger.service.js";
 
 const router = express.Router();
+
+const processWithdrawalTransferWebhook = async ({
+  requestId,
+  eventName,
+  reference,
+  event,
+}) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const withdrawalResult = await client.query(
+      `SELECT *
+       FROM withdrawals
+       WHERE provider_ref = $1
+       FOR UPDATE`,
+      [reference],
+    );
+
+    if (withdrawalResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      console.error(`[${requestId}] withdrawal not found`, { reference });
+      return;
+    }
+
+    const withdrawal = withdrawalResult.rows[0];
+
+    if (withdrawal.status !== "processing") {
+      await client.query("ROLLBACK");
+      console.log(`[${requestId}] withdrawal transfer ignored for non-processing status`, {
+        withdrawalId: withdrawal.id,
+        status: withdrawal.status,
+        event: eventName,
+      });
+      return;
+    }
+
+    const transferCode = event?.data?.transfer_code ?? null;
+
+    if (eventName === "transfer.success") {
+      await settleWithdrawal(client, withdrawal);
+
+      const updated = await client.query(
+        `UPDATE withdrawals
+         SET status = 'completed',
+             processed_at = NOW(),
+             failure_reason = NULL,
+             transfer_code = COALESCE($1, transfer_code)
+         WHERE id = $2
+         RETURNING *`,
+        [transferCode, withdrawal.id],
+      );
+
+      await client.query("COMMIT");
+      console.log(`[${requestId}] withdrawal completed`, {
+        withdrawalId: withdrawal.id,
+        reference,
+      });
+
+      try {
+        await pool.query(
+          `INSERT INTO notifications (user_id, title, message, type, related_id)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [
+            withdrawal.user_id,
+            "Withdrawal completed",
+            "Your withdrawal transfer was completed successfully.",
+            "withdrawal_completed",
+            updated.rows[0]?.id ?? withdrawal.id,
+          ],
+        );
+      } catch (notifyErr) {
+        console.error(`[${requestId}] withdrawal success notification failed`, notifyErr.message);
+      }
+      return;
+    }
+
+    const failureReason =
+      event?.data?.gateway_response ??
+      event?.data?.status ??
+      event?.data?.message ??
+      "Transfer failed";
+
+    await releaseWithdrawalHold(client, withdrawal, {
+      reversalType: "withdrawal_reversal",
+      idempotencySuffix: "reverse",
+    });
+
+    const updated = await client.query(
+      `UPDATE withdrawals
+       SET status = 'failed',
+           processed_at = NOW(),
+           failure_reason = COALESCE($1, failure_reason, 'Transfer failed'),
+           transfer_code = COALESCE($2, transfer_code)
+       WHERE id = $3
+       RETURNING *`,
+      [failureReason, transferCode, withdrawal.id],
+    );
+
+    await client.query("COMMIT");
+    console.log(`[${requestId}] withdrawal failed and reversed`, {
+      withdrawalId: withdrawal.id,
+      reference,
+    });
+
+    try {
+      await pool.query(
+        `INSERT INTO notifications (user_id, title, message, type, related_id)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          withdrawal.user_id,
+          "Withdrawal failed",
+          "Your withdrawal failed and funds were returned to your wallet.",
+          "withdrawal_failed",
+          updated.rows[0]?.id ?? withdrawal.id,
+        ],
+      );
+    } catch (notifyErr) {
+      console.error(`[${requestId}] withdrawal failure notification failed`, notifyErr.message);
+    }
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      // ignore rollback errors
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
+};
 
 /**
  * Paystack Webhook
@@ -140,6 +275,25 @@ router.post("/paystack", async (req, res) => {
 
   if (!reference) {
     console.error(`[${requestId}] missing reference`);
+    return res.sendStatus(200);
+  }
+
+  const isWithdrawalTransferEvent =
+    (eventName === "transfer.success" || eventName === "transfer.failed") &&
+    typeof reference === "string" &&
+    reference.startsWith("withdrawal_");
+
+  if (isWithdrawalTransferEvent) {
+    try {
+      await processWithdrawalTransferWebhook({
+        requestId,
+        eventName,
+        reference,
+        event,
+      });
+    } catch (withdrawalErr) {
+      console.error(`[${requestId}] withdrawal webhook processing error`, withdrawalErr.message);
+    }
     return res.sendStatus(200);
   }
 
