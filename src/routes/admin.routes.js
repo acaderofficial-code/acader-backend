@@ -104,7 +104,7 @@ router.get(
  * GET /api/admin/reports/ledger
  * Query params:
  * - user_id
- * - balance_type: available|escrow|locked|platform
+ * - balance_type: available|escrow|locked|platform|revenue
  * - type
  * - reference (partial match)
  * - from (ISO date)
@@ -135,7 +135,13 @@ router.get(
       1000,
     );
 
-    const allowedBalanceTypes = ["available", "escrow", "locked", "platform"];
+    const allowedBalanceTypes = [
+      "available",
+      "escrow",
+      "locked",
+      "platform",
+      "revenue",
+    ];
     const filters = [];
     const values = [];
 
@@ -152,7 +158,8 @@ router.get(
     if (balance_type !== undefined) {
       if (!allowedBalanceTypes.includes(balance_type)) {
         return res.status(400).json({
-          message: "Invalid balance_type. Use available|escrow|locked|platform",
+          message:
+            "Invalid balance_type. Use available|escrow|locked|platform|revenue",
         });
       }
       values.push(balance_type);
@@ -245,6 +252,23 @@ router.get(
       ${platformWhere}
     `;
 
+    const revenueFilters = ["balance_type = 'revenue'"];
+    const revenueValues = [];
+    if (toIso) {
+      revenueValues.push(toIso);
+      revenueFilters.push(`created_at <= $${revenueValues.length}`);
+    }
+    const revenueWhere = `WHERE ${revenueFilters.join(" AND ")}`;
+
+    const revenueQuery = `
+      SELECT
+        COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount ELSE 0 END), 0) AS total_credits,
+        COALESCE(SUM(CASE WHEN direction = 'debit' THEN amount ELSE 0 END), 0) AS total_debits,
+        COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount WHEN direction = 'debit' THEN -amount ELSE 0 END), 0) AS balance
+      FROM ledger_entries
+      ${revenueWhere}
+    `;
+
     const perUserValues = [];
     const perUserFilters = ["le.user_id IS NOT NULL"];
     if (parsedUserId) {
@@ -270,6 +294,9 @@ router.get(
         COALESCE(SUM(CASE WHEN le.balance_type = 'locked' AND le.direction = 'credit' THEN le.amount
                           WHEN le.balance_type = 'locked' AND le.direction = 'debit' THEN -le.amount
                           ELSE 0 END), 0) AS locked_balance,
+        COALESCE(SUM(CASE WHEN le.balance_type = 'revenue' AND le.direction = 'credit' THEN le.amount
+                          WHEN le.balance_type = 'revenue' AND le.direction = 'debit' THEN -le.amount
+                          ELSE 0 END), 0) AS revenue_balance,
         COALESCE(SUM(CASE WHEN le.direction = 'credit' THEN le.amount
                           WHEN le.direction = 'debit' THEN -le.amount
                           ELSE 0 END), 0) AS net_balance
@@ -281,12 +308,20 @@ router.get(
       LIMIT $${perUserValues.length}
     `;
 
-    const [summaryResult, countResult, entriesResult, platformResult, perUserResult] =
+    const [
+      summaryResult,
+      countResult,
+      entriesResult,
+      platformResult,
+      revenueResult,
+      perUserResult,
+    ] =
       await Promise.all([
         pool.query(summaryQuery, values),
         pool.query(countQuery, values),
         pool.query(entriesQuery, [...values, parsedLimit, parsedOffset]),
         pool.query(platformQuery, platformValues),
+        pool.query(revenueQuery, revenueValues),
         pool.query(perUserQuery, perUserValues),
       ]);
 
@@ -306,6 +341,7 @@ router.get(
       },
       summary: summaryResult.rows[0],
       platform_balance: platformResult.rows[0],
+      revenue_balance: revenueResult.rows[0],
       per_user_balances: perUserResult.rows,
       entries: entriesResult.rows,
     });

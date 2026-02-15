@@ -10,6 +10,7 @@ const BALANCE_TYPE = {
   ESCROW: "escrow",
   LOCKED: "locked",
   PLATFORM: "platform",
+  REVENUE: "revenue",
 };
 
 const toPositiveAmount = (value) => {
@@ -31,8 +32,46 @@ const getPlatformFeePercent = () => {
   return Math.min(parsed, 100);
 };
 
+const getAcaderSystemUserId = () => {
+  const parsed = Number(process.env.ACADER_SYSTEM_USER_ID);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error("ACADER_SYSTEM_USER_ID must be a positive integer");
+  }
+  return parsed;
+};
+
 const uniqueInts = (values) =>
   [...new Set(values.filter((v) => Number.isInteger(v) && v > 0))];
+
+const computeReleaseSplitAmounts = (grossAmount) => {
+  const feePercent = getPlatformFeePercent();
+  if (feePercent <= 0) {
+    throw new Error("PLATFORM_FEE_PERCENT must be greater than 0 for release");
+  }
+
+  const feeAmount = roundToCurrency((grossAmount * feePercent) / 100);
+  if (feeAmount <= 0) {
+    throw new Error("Computed platform fee must be greater than 0");
+  }
+  if (feeAmount >= grossAmount) {
+    throw new Error("Computed platform fee must be less than gross amount");
+  }
+
+  const studentNetAmount = roundToCurrency(grossAmount - feeAmount);
+  if (studentNetAmount <= 0) {
+    throw new Error("Computed student net amount must be greater than 0");
+  }
+
+  const delta = roundToCurrency(grossAmount - (studentNetAmount + feeAmount));
+  if (Math.abs(delta) > 0.000001) {
+    throw new Error("Release split invariant failed: gross != net + fee");
+  }
+
+  return {
+    feeAmount,
+    studentNetAmount,
+  };
+};
 
 export const createLedgerEntry = async (client, entry) => {
   const {
@@ -226,8 +265,8 @@ export const applyPaymentTransitionLedger = async (
   const disputedFundsUserId =
     payment.escrow === true ? companyUserId : studentUserId;
 
-  const ensureStudentRecipient = () => {
-    if (options.requireStudentUserId && !hasExplicitStudentUserId) {
+  const ensureStudentRecipient = (required = false) => {
+    if ((required || options.requireStudentUserId) && !hasExplicitStudentUserId) {
       throw new Error("Student user id is required for this transition");
     }
   };
@@ -254,33 +293,70 @@ export const applyPaymentTransitionLedger = async (
     return result;
   };
 
-  const applyPlatformFee = async (feePayerUserId) => {
-    if (!Number.isInteger(feePayerUserId) || feePayerUserId <= 0) {
-      return false;
+  const applyReleaseWithPlatformFee = async ({
+    kind,
+    debitUserId,
+    debitBalanceType,
+    studentUserId: creditStudentUserId,
+  }) => {
+    if (!Number.isInteger(debitUserId) || debitUserId <= 0) {
+      throw new Error("Invalid debit user id for release transition");
+    }
+    if (!Number.isInteger(creditStudentUserId) || creditStudentUserId <= 0) {
+      throw new Error("Invalid student user id for release transition");
     }
 
-    const feePercent = getPlatformFeePercent();
-    if (feePercent <= 0) {
-      return false;
-    }
+    const { feeAmount, studentNetAmount } = computeReleaseSplitAmounts(amount);
+    const revenueUserId = getAcaderSystemUserId();
+    const releaseBase = `${idempotencyPrefix}:${kind}`;
 
-    const feeAmount = roundToCurrency((amount * feePercent) / 100);
-    if (feeAmount <= 0) {
-      return false;
-    }
-
-    await createDoubleEntry(client, {
-      amount: feeAmount,
+    const escrowDebit = await createLedgerEntry(client, {
+      userId: debitUserId,
+      amount,
+      direction: DIRECTION.DEBIT,
+      balanceType: debitBalanceType,
+      type: "release",
       reference,
-      idempotencyBase: `${idempotencyPrefix}:platform_fee`,
-      type: "fee",
-      debitUserId: feePayerUserId,
-      debitBalanceType: BALANCE_TYPE.AVAILABLE,
-      creditUserId: null,
-      creditBalanceType: BALANCE_TYPE.PLATFORM,
+      idempotencyKey: `${releaseBase}:escrow_debit`,
     });
 
-    return true;
+    const studentCredit = await createLedgerEntry(client, {
+      userId: creditStudentUserId,
+      amount: studentNetAmount,
+      direction: DIRECTION.CREDIT,
+      balanceType: BALANCE_TYPE.AVAILABLE,
+      type: "release",
+      reference,
+      idempotencyKey: `${releaseBase}:student_credit`,
+    });
+
+    const revenueCredit = await createLedgerEntry(client, {
+      userId: revenueUserId,
+      amount: feeAmount,
+      direction: DIRECTION.CREDIT,
+      balanceType: BALANCE_TYPE.REVENUE,
+      type: "platform_fee",
+      reference,
+      idempotencyKey: `${releaseBase}:platform_fee_credit`,
+    });
+
+    if (
+      escrowDebit.inserted !== studentCredit.inserted ||
+      escrowDebit.inserted !== revenueCredit.inserted
+    ) {
+      throw new Error(
+        "Ledger idempotency mismatch: release split insert states are inconsistent",
+      );
+    }
+
+    return {
+      applied: escrowDebit.inserted,
+      escrowDebit: escrowDebit.row,
+      studentCredit: studentCredit.row,
+      revenueCredit: revenueCredit.row,
+      feeAmount,
+      studentNetAmount,
+    };
   };
 
   let result = { applied: false };
@@ -297,20 +373,17 @@ export const applyPaymentTransitionLedger = async (
       });
       break;
     case "paid->released":
-      ensureStudentRecipient();
-      result = await run({
+      ensureStudentRecipient(true);
+      result = await applyReleaseWithPlatformFee({
         kind: "release",
-        type: "release",
         debitUserId: companyUserId,
         debitBalanceType: BALANCE_TYPE.ESCROW,
-        creditUserId: studentUserId,
-        creditBalanceType: BALANCE_TYPE.AVAILABLE,
+        studentUserId,
       });
-      await applyPlatformFee(studentUserId);
       walletUserIds.push(companyUserId, studentUserId);
       break;
     case "released->disputed":
-      ensureStudentRecipient();
+      ensureStudentRecipient(true);
       result = await run({
         kind: "dispute_hold",
         type: "dispute_hold",
@@ -332,17 +405,14 @@ export const applyPaymentTransitionLedger = async (
       });
       break;
     case "disputed->released":
-      ensureStudentRecipient();
+      ensureStudentRecipient(true);
       ensureDisputedFundsOwner();
-      result = await run({
+      result = await applyReleaseWithPlatformFee({
         kind: "dispute_release",
-        type: "release",
         debitUserId: disputedFundsUserId,
         debitBalanceType: BALANCE_TYPE.LOCKED,
-        creditUserId: studentUserId,
-        creditBalanceType: BALANCE_TYPE.AVAILABLE,
+        studentUserId,
       });
-      await applyPlatformFee(studentUserId);
       walletUserIds.push(disputedFundsUserId, studentUserId);
       break;
     case "paid->refunded":
@@ -356,7 +426,7 @@ export const applyPaymentTransitionLedger = async (
       });
       break;
     case "released->refunded":
-      ensureStudentRecipient();
+      ensureStudentRecipient(true);
       result = await run({
         kind: "refund",
         type: "refund",
