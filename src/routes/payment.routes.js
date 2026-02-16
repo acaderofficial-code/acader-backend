@@ -10,7 +10,11 @@ import {
   markPaymentAsPaidByReference,
   verifyPaystackReference,
 } from "../services/paystack.service.js";
-import { applyPaymentTransitionLedger } from "../services/ledger.service.js";
+import {
+  applyPaymentRefundLedger,
+  applyPaymentTransitionLedger,
+  syncWalletAvailableBalances,
+} from "../services/ledger.service.js";
 
 const router = express.Router();
 
@@ -186,7 +190,7 @@ router.patch(
       return res.status(400).json({ message: "Invalid payment id" });
     }
 
-    const allowed = ["pending", "paid", "released", "refunded", "disputed"];
+    const allowed = ["pending", "paid", "released", "disputed"];
     if (!allowed.includes(status)) {
       return res.status(400).json({ message: "Invalid status value" });
     }
@@ -228,13 +232,14 @@ router.patch(
 
     const transitions = {
       pending: ["paid"],
-      paid: ["released", "refunded"],
+      paid: ["released"],
       released: ["disputed"],
-      disputed: ["released", "refunded"],
+      disputed: ["released"],
       refunded: [],
     };
 
-    if (!transitions[currentStatus].includes(status)) {
+    const nextAllowed = transitions[currentStatus] ?? [];
+    if (!nextAllowed.includes(status)) {
       return res.status(400).json({
         message: `Invalid transition: ${currentStatus} → ${status}`,
       });
@@ -278,7 +283,6 @@ router.patch(
 
     if (status === "paid") escrow = true;
     if (status === "released") escrow = false;
-    if (status === "refunded") escrow = false;
 
     const client = await pool.connect();
     let updatedPayment;
@@ -380,6 +384,202 @@ router.patch(
 
     res.json({
       message: `Payment moved to ${status}`,
+      payment: updatedPayment,
+    });
+  }),
+);
+
+/**
+ * Refund a payment (admin only)
+ * POST /api/payments/:id/refund
+ */
+router.post(
+  "/:id/refund",
+  verifyToken,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const reason =
+      typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+
+    if (Number.isNaN(id)) {
+      return res.status(400).json({ message: "Invalid payment id" });
+    }
+
+    const client = await pool.connect();
+    let updatedPayment = null;
+    let refundType = null;
+    let companyUserId = null;
+    let studentUserId = null;
+    let previousStatus = null;
+
+    try {
+      await client.query("BEGIN");
+
+      const paymentResult = await client.query(
+        `
+        SELECT
+          pay.*,
+          c.user_id AS company_user_id,
+          a.user_id AS student_user_id
+        FROM payments pay
+        LEFT JOIN companies c ON c.id = pay.company_id
+        LEFT JOIN applications a ON a.id = pay.application_id
+        WHERE pay.id = $1
+        FOR UPDATE OF pay
+        `,
+        [id],
+      );
+
+      if (paymentResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "Payment not found" });
+      }
+
+      const payment = paymentResult.rows[0];
+      previousStatus = payment.status;
+      companyUserId = Number(payment.company_user_id);
+      studentUserId = Number(payment.student_user_id);
+
+      if (payment.status === "refunded") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Payment is already refunded" });
+      }
+
+      if (payment.status === "withdrawn") {
+        await client.query("ROLLBACK");
+        return res
+          .status(400)
+          .json({ message: "Refund blocked: payment already withdrawn" });
+      }
+
+      if (!["paid", "released"].includes(payment.status)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          message: "Refund is only allowed for paid or released payments",
+        });
+      }
+
+      if (!Number.isInteger(companyUserId) || companyUserId <= 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Invalid company for refund" });
+      }
+
+      const openDispute = await client.query(
+        `SELECT id
+         FROM disputes
+         WHERE payment_id = $1
+           AND status = 'open'
+         LIMIT 1`,
+        [id],
+      );
+
+      if (openDispute.rows.length > 0) {
+        await client.query("ROLLBACK");
+        return res
+          .status(400)
+          .json({ message: "Refund blocked: payment has an open dispute" });
+      }
+
+      if (payment.status === "released") {
+        if (!Number.isInteger(studentUserId) || studentUserId <= 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ message: "Invalid student for refund" });
+        }
+
+        const payoutActivity = await client.query(
+          `
+          SELECT id
+          FROM withdrawals
+          WHERE user_id = $1
+            AND status IN ('processing', 'completed')
+            AND created_at >= COALESCE($2::timestamp, '-infinity'::timestamp)
+          ORDER BY created_at DESC
+          LIMIT 1
+          `,
+          [studentUserId, payment.released_at ?? payment.created_at ?? null],
+        );
+
+        if (payoutActivity.rows.length > 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            message:
+              "Refund blocked: withdrawal activity detected after payment release",
+          });
+        }
+      }
+
+      const refundResult = await applyPaymentRefundLedger(client, payment, {
+        idempotencyPrefix: `payment:${payment.id}:${payment.status}->refunded`,
+        companyUserId,
+        studentUserId:
+          Number.isInteger(studentUserId) && studentUserId > 0
+            ? studentUserId
+            : undefined,
+      });
+
+      refundType = refundResult.refundType;
+
+      if ((refundResult.walletUserIds ?? []).length > 0) {
+        await syncWalletAvailableBalances(client, refundResult.walletUserIds);
+      }
+
+      const updateResult = await client.query(
+        `
+        UPDATE payments
+        SET status = 'refunded',
+            escrow = false,
+            refunded_at = COALESCE(refunded_at, NOW())
+        WHERE id = $1
+        RETURNING *
+        `,
+        [id],
+      );
+
+      if (updateResult.rowCount !== 1) {
+        throw new Error("Payment update failed");
+      }
+
+      updatedPayment = updateResult.rows[0];
+      await client.query("COMMIT");
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // ignore rollback failure
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const companyRefundMessage = reason
+      ? `Your payment has been refunded. Reason: ${reason}`
+      : "Your payment has been refunded.";
+
+    await safeNotify(companyUserId, "payment_refunded", companyRefundMessage, id);
+
+    if (
+      previousStatus === "released" &&
+      Number.isInteger(studentUserId) &&
+      studentUserId > 0 &&
+      studentUserId !== companyUserId
+    ) {
+      const studentRefundMessage = reason
+        ? `A payment linked to your work was refunded. Reason: ${reason}`
+        : "A payment linked to your work was refunded.";
+
+      await safeNotify(
+        studentUserId,
+        "payment_refunded",
+        studentRefundMessage,
+        id,
+      );
+    }
+
+    res.json({
+      message: "Payment refunded successfully",
+      refund_type: refundType,
       payment: updatedPayment,
     });
   }),

@@ -14,6 +14,11 @@ const BALANCE_TYPE = {
   PAYOUT: "payout",
 };
 
+const REFUND_TYPE = {
+  ESCROW: "escrow_refund",
+  RELEASED: "released_refund",
+};
+
 const toPositiveAmount = (value) => {
   const amount = Number(value);
   if (!Number.isFinite(amount) || amount <= 0) {
@@ -233,6 +238,163 @@ export const getUserBalanceByType = async (
   return Number(result.rows[0]?.balance ?? 0);
 };
 
+export const applyPaymentRefundLedger = async (
+  client,
+  payment,
+  options = {},
+) => {
+  if (!payment) {
+    throw new Error("payment is required");
+  }
+
+  const fromStatus = payment.status;
+  if (!["paid", "released"].includes(fromStatus)) {
+    throw new Error("Refund is only supported for paid or released payments");
+  }
+
+  const amount = toPositiveAmount(payment.amount);
+  const reference = payment.provider_ref ?? `payment:${payment.id}`;
+  const idempotencyPrefix =
+    options.idempotencyPrefix ?? `payment:${payment.id}:${fromStatus}->refunded`;
+
+  const companyUserRaw = options.companyUserId ?? payment.company_user_id;
+  const companyUserId = Number(companyUserRaw);
+  if (!Number.isInteger(companyUserId) || companyUserId <= 0) {
+    throw new Error("Invalid company user id for payment refund");
+  }
+
+  if (fromStatus === "paid") {
+    const result = await createDoubleEntry(client, {
+      amount,
+      reference,
+      idempotencyBase: `${idempotencyPrefix}:escrow_refund`,
+      type: "refund_escrow",
+      debitUserId: companyUserId,
+      debitBalanceType: BALANCE_TYPE.ESCROW,
+      creditUserId: companyUserId,
+      creditBalanceType: BALANCE_TYPE.AVAILABLE,
+    });
+
+    return {
+      applied: result.applied,
+      refundType: REFUND_TYPE.ESCROW,
+      walletUserIds: [companyUserId],
+    };
+  }
+
+  const studentUserRaw = options.studentUserId ?? payment.student_user_id;
+  const studentUserId = Number(studentUserRaw);
+  if (!Number.isInteger(studentUserId) || studentUserId <= 0) {
+    throw new Error("Invalid student user id for released refund");
+  }
+
+  const revenueResult = await client.query(
+    `
+    SELECT
+      user_id,
+      COALESCE(SUM(
+        CASE
+          WHEN direction = 'credit' THEN amount
+          WHEN direction = 'debit' THEN -amount
+          ELSE 0
+        END
+      ), 0) AS revenue_balance
+    FROM ledger_entries
+    WHERE reference = $1
+      AND balance_type = 'revenue'
+    GROUP BY user_id
+    ORDER BY revenue_balance DESC
+    LIMIT 1
+    `,
+    [reference],
+  );
+
+  const revenueUserId = Number(revenueResult.rows[0]?.user_id);
+  const revenueBalance = Number(revenueResult.rows[0]?.revenue_balance ?? 0);
+  const revenueDebitAmount = roundToCurrency(
+    Math.min(amount, Math.max(revenueBalance, 0)),
+  );
+  const studentDebitAmount = roundToCurrency(amount - revenueDebitAmount);
+
+  if (studentDebitAmount < 0 || revenueDebitAmount < 0) {
+    throw new Error("Invalid released refund split");
+  }
+
+  const debitTotal = roundToCurrency(studentDebitAmount + revenueDebitAmount);
+  if (Math.abs(debitTotal - amount) > 0.000001) {
+    throw new Error("Released refund invariant failed: debit != credit");
+  }
+
+  const studentAvailableBalance = await getUserBalanceByType(
+    client,
+    studentUserId,
+    BALANCE_TYPE.AVAILABLE,
+  );
+
+  if (studentAvailableBalance + 0.000001 < studentDebitAmount) {
+    throw new Error("Insufficient student available balance for released refund");
+  }
+
+  const entries = [];
+
+  if (studentDebitAmount > 0) {
+    entries.push(
+      await createLedgerEntry(client, {
+        userId: studentUserId,
+        amount: studentDebitAmount,
+        direction: DIRECTION.DEBIT,
+        balanceType: BALANCE_TYPE.AVAILABLE,
+        type: "refund_reversal",
+        reference,
+        idempotencyKey: `${idempotencyPrefix}:refund_reversal:student_debit`,
+      }),
+    );
+  }
+
+  if (revenueDebitAmount > 0) {
+    if (!Number.isInteger(revenueUserId) || revenueUserId <= 0) {
+      throw new Error("Missing platform revenue owner for released refund");
+    }
+
+    entries.push(
+      await createLedgerEntry(client, {
+        userId: revenueUserId,
+        amount: revenueDebitAmount,
+        direction: DIRECTION.DEBIT,
+        balanceType: BALANCE_TYPE.REVENUE,
+        type: "refund_released",
+        reference,
+        idempotencyKey: `${idempotencyPrefix}:refund_released:revenue_debit`,
+      }),
+    );
+  }
+
+  entries.push(
+    await createLedgerEntry(client, {
+      userId: companyUserId,
+      amount,
+      direction: DIRECTION.CREDIT,
+      balanceType: BALANCE_TYPE.AVAILABLE,
+      type: "refund_released",
+      reference,
+      idempotencyKey: `${idempotencyPrefix}:refund_released:company_credit`,
+    }),
+  );
+
+  const insertStates = [...new Set(entries.map((entry) => entry.inserted))];
+  if (insertStates.length > 1) {
+    throw new Error(
+      "Ledger idempotency mismatch: released refund insert states are inconsistent",
+    );
+  }
+
+  return {
+    applied: insertStates[0] ?? false,
+    refundType: REFUND_TYPE.RELEASED,
+    walletUserIds: [companyUserId, studentUserId],
+  };
+};
+
 export const applyPaymentTransitionLedger = async (
   client,
   payment,
@@ -417,26 +579,20 @@ export const applyPaymentTransitionLedger = async (
       walletUserIds.push(disputedFundsUserId, studentUserId);
       break;
     case "paid->refunded":
-      result = await run({
-        kind: "refund",
-        type: "refund",
-        debitUserId: companyUserId,
-        debitBalanceType: BALANCE_TYPE.ESCROW,
-        creditUserId: null,
-        creditBalanceType: BALANCE_TYPE.PLATFORM,
+      result = await applyPaymentRefundLedger(client, payment, {
+        idempotencyPrefix,
+        companyUserId,
+        studentUserId,
       });
+      walletUserIds.push(...(result.walletUserIds ?? []));
       break;
     case "released->refunded":
-      ensureStudentRecipient(true);
-      result = await run({
-        kind: "refund",
-        type: "refund",
-        debitUserId: studentUserId,
-        debitBalanceType: BALANCE_TYPE.AVAILABLE,
-        creditUserId: null,
-        creditBalanceType: BALANCE_TYPE.PLATFORM,
+      result = await applyPaymentRefundLedger(client, payment, {
+        idempotencyPrefix,
+        companyUserId,
+        studentUserId,
       });
-      walletUserIds.push(studentUserId);
+      walletUserIds.push(...(result.walletUserIds ?? []));
       break;
     case "disputed->refunded":
       ensureDisputedFundsOwner();
@@ -521,3 +677,4 @@ export const settleWithdrawal = async (client, withdrawal) => {
 };
 
 export const BALANCE_TYPES = BALANCE_TYPE;
+export const REFUND_TYPES = REFUND_TYPE;
