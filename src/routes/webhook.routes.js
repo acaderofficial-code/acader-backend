@@ -300,13 +300,12 @@ router.post("/paystack", async (req, res) => {
   const statusByEvent = {
     "charge.success": "paid",
     "charge.failed": "failed",
-    "charge.dispute.create": "disputed",
     "transfer.success": "released",
     "transfer.failed": "transfer_failed",
     "refund.processed": "refunded",
   };
 
-  const nextStatus = statusByEvent[eventName];
+  const nextStatus = statusByEvent[eventName] ?? null;
   let updatedPayment = null;
 
   // 4) Critical write path: payment status update in isolated transaction.
@@ -334,6 +333,16 @@ router.post("/paystack", async (req, res) => {
       }
 
       const payment = paymentResult.rows[0];
+
+      if (payment.disputed === true && eventName !== "charge.dispute.create") {
+        await client.query("ROLLBACK");
+        console.log(`[${requestId}] payment event ignored due to active dispute`, {
+          paymentId: payment.id,
+          reference,
+          event: eventName,
+        });
+        return res.sendStatus(200);
+      }
 
       // Only release escrow from a paid state.
       if (eventName === "transfer.success" && payment.status !== "paid") {
@@ -365,19 +374,77 @@ router.post("/paystack", async (req, res) => {
           event?.data?.message ??
           "Charge dispute opened by provider";
 
-        console.log(`[${requestId}] inserting dispute`, {
+        console.log(`[${requestId}] opening dispute`, {
           paymentId: payment.id,
           reason,
         });
 
-        const disputeInsert = await client.query(
-          `INSERT INTO disputes (payment_id, raised_by, reason, status, created_at)
-           VALUES ($1, $2, $3, 'open', NOW())
-           RETURNING id`,
-          [payment.id, payment.user_id, reason],
+        const existingDispute = await client.query(
+          `
+          SELECT id
+          FROM disputes
+          WHERE payment_id = $1
+            AND status IN ('open', 'under_review')
+          ORDER BY created_at DESC
+          LIMIT 1
+          `,
+          [payment.id],
         );
 
-        disputeId = disputeInsert.rows[0]?.id ?? null;
+        if (existingDispute.rows.length > 0) {
+          disputeId = existingDispute.rows[0].id;
+        } else {
+          const disputeInsert = await client.query(
+            `INSERT INTO disputes (payment_id, raised_by, reason, status, created_at)
+             VALUES ($1, $2, $3, 'open', NOW())
+             RETURNING id`,
+            [payment.id, payment.user_id, reason],
+          );
+
+          disputeId = disputeInsert.rows[0]?.id ?? null;
+        }
+
+        const paymentDisputeUpdate = await client.query(
+          `
+          UPDATE payments
+          SET disputed = true
+          WHERE id = $1
+          RETURNING id, user_id, status, escrow, disputed
+          `,
+          [payment.id],
+        );
+
+        updatedPayment = {
+          ...(paymentDisputeUpdate.rows[0] ?? {}),
+          dispute_id: disputeId,
+          notification_user_id: payment.user_id,
+        };
+
+        await client.query("COMMIT");
+        console.log(`[${requestId}] dispute gate activated`, {
+          paymentId: payment.id,
+          disputeId,
+        });
+
+        try {
+          await pool.query(
+            `INSERT INTO notifications (user_id, title, message, type, related_id)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [
+              payment.user_id,
+              "Dispute opened",
+              "A dispute has been opened on this payment and actions are now frozen.",
+              "payment_disputed",
+              disputeId ?? payment.id,
+            ],
+          );
+        } catch (notifyErr) {
+          console.error(`[${requestId}] dispute notification failed`, notifyErr.message);
+        }
+
+        console.log(`Dispute opened: ${reference}`);
+        console.log(`Processed ${eventName} for ${reference}`);
+        return res.sendStatus(200);
       }
 
       await applyPaymentTransitionLedger(client, payment, nextStatus, {

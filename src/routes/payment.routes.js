@@ -190,7 +190,7 @@ router.patch(
       return res.status(400).json({ message: "Invalid payment id" });
     }
 
-    const allowed = ["pending", "paid", "released", "disputed"];
+    const allowed = ["pending", "paid", "released"];
     if (!allowed.includes(status)) {
       return res.status(400).json({ message: "Invalid status value" });
     }
@@ -205,6 +205,12 @@ router.patch(
 
     const payment = current.rows[0];
     const currentStatus = payment.status;
+    if (payment.disputed === true) {
+      return res.status(409).json({
+        message: "Payment is under dispute",
+      });
+    }
+
     let escrow = payment.escrow;
     let companyUserId = null;
     let studentUserId = null;
@@ -233,8 +239,7 @@ router.patch(
     const transitions = {
       pending: ["paid"],
       paid: ["released"],
-      released: ["disputed"],
-      disputed: ["released"],
+      released: [],
       refunded: [],
     };
 
@@ -441,6 +446,13 @@ router.post(
       companyUserId = Number(payment.company_user_id);
       studentUserId = Number(payment.student_user_id);
 
+      if (payment.disputed === true) {
+        await client.query("ROLLBACK");
+        return res
+          .status(409)
+          .json({ message: "Refund blocked: payment is under dispute" });
+      }
+
       if (payment.status === "refunded") {
         await client.query("ROLLBACK");
         return res.status(400).json({ message: "Payment is already refunded" });
@@ -469,7 +481,7 @@ router.post(
         `SELECT id
          FROM disputes
          WHERE payment_id = $1
-           AND status = 'open'
+           AND status IN ('open', 'under_review')
          LIMIT 1`,
         [id],
       );
@@ -600,9 +612,15 @@ router.post(
       return res.status(400).json({ message: "Invalid payment id" });
     }
 
-    const payment = await pool.query("SELECT * FROM payments WHERE id = $1", [
-      id,
-    ]);
+    const payment = await pool.query(
+      `
+      SELECT pay.*, a.user_id AS student_user_id
+      FROM payments pay
+      LEFT JOIN applications a ON a.id = pay.application_id
+      WHERE pay.id = $1
+      `,
+      [id],
+    );
 
     if (payment.rows.length === 0) {
       return res.status(404).json({ message: "Payment not found" });
@@ -613,14 +631,36 @@ router.post(
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    if (pay.status !== "released") {
+    if (pay.disputed === true || pay.status === "disputed") {
+      return res.status(409).json({
+        message: "Payment is already under dispute",
+      });
+    }
+
+    if (pay.status === "withdrawn") {
       return res.status(400).json({
-        message: "Only released payments can be disputed",
+        message: "Withdrawn payments cannot be disputed",
+      });
+    }
+
+    if (pay.status === "refunded") {
+      return res.status(400).json({
+        message: "Refunded payments cannot be disputed",
+      });
+    }
+
+    if (!["paid", "released"].includes(pay.status)) {
+      return res.status(400).json({
+        message: "Only paid or released payments can be disputed",
       });
     }
 
     const existing = await pool.query(
-      "SELECT id FROM disputes WHERE payment_id = $1 AND status = 'open'",
+      `SELECT id
+       FROM disputes
+       WHERE payment_id = $1
+         AND status IN ('open', 'under_review')
+       LIMIT 1`,
       [id],
     );
 
@@ -636,42 +676,24 @@ router.post(
       await client.query("BEGIN");
 
       const created = await client.query(
-        `INSERT INTO disputes (payment_id, raised_by, reason)
-         VALUES ($1, $2, $3)
+        `INSERT INTO disputes (payment_id, raised_by, reason, status, created_at)
+         VALUES ($1, $2, $3, 'open', NOW())
          RETURNING *`,
         [id, raised_by, reason ?? ""],
       );
       dispute = created.rows[0];
-      const partiesInTx = await client.query(
-        `
-        SELECT c.user_id AS company_user_id, a.user_id AS student_user_id
-        FROM payments pay
-        LEFT JOIN companies c ON c.id = pay.company_id
-        LEFT JOIN applications a ON a.id = pay.application_id
-        WHERE pay.id = $1
-        `,
-        [id],
-      );
-      const companyUserIdInTx = Number(partiesInTx.rows[0]?.company_user_id);
-      const studentUserIdInTx = Number(partiesInTx.rows[0]?.student_user_id);
 
-      await applyPaymentTransitionLedger(client, pay, "disputed", {
-        idempotencyPrefix: `payment:${pay.id}:${pay.status}->disputed`,
-        companyUserId:
-          Number.isInteger(companyUserIdInTx) && companyUserIdInTx > 0
-            ? companyUserIdInTx
-            : undefined,
-        studentUserId:
-          Number.isInteger(studentUserIdInTx) && studentUserIdInTx > 0
-            ? studentUserIdInTx
-            : undefined,
-      });
+      await client.query("UPDATE payments SET disputed = true WHERE id = $1", [id]);
 
-      await client.query("UPDATE payments SET status='disputed' WHERE id=$1", [id]);
       await client.query(
         `INSERT INTO notifications (user_id, type, message, related_id)
          VALUES ($1, $2, $3, $4)`,
-        [pay.user_id, "dispute_opened", "A dispute has been opened on your payment.", id],
+        [
+          pay.user_id,
+          "dispute_opened",
+          "A dispute has been opened on your payment and actions are now frozen.",
+          id,
+        ],
       );
 
       await client.query("COMMIT");
@@ -685,9 +707,23 @@ router.post(
     await safeNotify(
       pay.user_id,
       "dispute_opened",
-      "A dispute has been opened on your payment.",
+      "A dispute has been opened on your payment and actions are now frozen.",
       id,
     );
+
+    const studentUserId = Number(pay.student_user_id);
+    if (
+      Number.isInteger(studentUserId) &&
+      studentUserId > 0 &&
+      studentUserId !== pay.user_id
+    ) {
+      await safeNotify(
+        studentUserId,
+        "dispute_opened",
+        "A payment tied to your work is under dispute. Payout actions are frozen.",
+        id,
+      );
+    }
 
     res.status(201).json({
       message: "Dispute raised successfully",

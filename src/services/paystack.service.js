@@ -56,6 +56,13 @@ export const markPaymentAsPaidByReference = async (
     }
 
     const payment = existing.rows[0];
+    if (payment.disputed === true) {
+      await client.query("ROLLBACK");
+      const err = new Error("Payment is under dispute");
+      err.status = 409;
+      throw err;
+    }
+
     if (enforceUserId && payment.user_id !== enforceUserId) {
       await client.query("ROLLBACK");
       const err = new Error("Forbidden");

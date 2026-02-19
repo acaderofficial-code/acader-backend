@@ -4,7 +4,12 @@ import { requireAdmin } from "../middleware/admin.js";
 import { verifyToken } from "../middleware/auth.middleware.js";
 import { safeNotify } from "../utils/notify.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
-import { applyPaymentTransitionLedger } from "../services/ledger.service.js";
+import {
+  applyPaymentPartialRefundLedger,
+  applyPaymentRefundLedger,
+  applyPaymentTransitionLedger,
+  syncWalletAvailableBalances,
+} from "../services/ledger.service.js";
 
 const router = express.Router();
 
@@ -22,7 +27,7 @@ router.get(
       "SELECT SUM(amount) FROM payments WHERE status = 'paid' OR status = 'released'",
     );
     const disputes = await pool.query(
-      "SELECT COUNT(*) FROM disputes WHERE status = 'open'",
+      "SELECT COUNT(*) FROM disputes WHERE status IN ('open', 'under_review')",
     );
     const withdrawals = await pool.query(
       "SELECT COUNT(*) FROM withdrawals WHERE status = 'pending'",
@@ -353,26 +358,28 @@ router.get(
 );
 
 /**
- * Admin resolves dispute
+ * Admin dispute status update
+ * PATCH /api/admin/disputes/:id/status
+ * body: { status: "under_review" | "rejected" }
  */
 router.patch(
-  "/disputes/:id/resolve",
+  "/disputes/:id/status",
   asyncHandler(async (req, res) => {
     const id = parseInt(req.params.id, 10);
-    const { resolution } = req.body;
+    const { status } = req.body ?? {};
 
     if (Number.isNaN(id)) {
       return res.status(400).json({ message: "Invalid dispute id" });
     }
 
-    const allowed = ["release", "refund"];
-    if (!allowed.includes(resolution)) {
-      return res.status(400).json({ message: "Invalid resolution" });
+    const allowed = ["under_review", "rejected"];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({ message: "Invalid status" });
     }
 
     const client = await pool.connect();
     let updatedDispute;
-    let paymentUserId;
+    let payment;
     try {
       await client.query("BEGIN");
 
@@ -380,13 +387,167 @@ router.patch(
         `
         SELECT
           d.*,
-          p.id as payment_id,
-          p.status as payment_status,
-          p.amount as payment_amount,
-          p.user_id as payment_user_id,
-          p.application_id as payment_application_id,
-          a.user_id as student_user_id,
-          c.user_id as company_user_id
+          p.id AS payment_id,
+          p.status AS payment_status,
+          p.disputed AS payment_disputed,
+          p.user_id AS payment_user_id,
+          a.user_id AS student_user_id
+        FROM disputes d
+        JOIN payments p ON d.payment_id = p.id
+        LEFT JOIN applications a ON a.id = p.application_id
+        WHERE d.id = $1
+        FOR UPDATE OF d, p
+        `,
+        [id],
+      );
+
+      if (disputeResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "Dispute not found" });
+      }
+
+      const dispute = disputeResult.rows[0];
+      payment = dispute;
+
+      if (["resolved", "rejected"].includes(dispute.status)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Dispute already closed" });
+      }
+
+      if (status === "under_review") {
+        const updated = await client.query(
+          `
+          UPDATE disputes
+          SET status = 'under_review'
+          WHERE id = $1
+          RETURNING *
+          `,
+          [id],
+        );
+        updatedDispute = updated.rows[0];
+      }
+
+      if (status === "rejected") {
+        const updated = await client.query(
+          `
+          UPDATE disputes
+          SET status = 'rejected',
+              resolved_at = NOW()
+          WHERE id = $1
+          RETURNING *
+          `,
+          [id],
+        );
+        updatedDispute = updated.rows[0];
+
+        await client.query(
+          `
+          UPDATE payments
+          SET disputed = false
+          WHERE id = $1
+          `,
+          [dispute.payment_id],
+        );
+      }
+
+      await client.query("COMMIT");
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // ignore rollback failure
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    await safeNotify(
+      payment.payment_user_id,
+      "dispute_status_updated",
+      `Dispute status updated to ${status}.`,
+      id,
+    );
+
+    const studentUserId = Number(payment.student_user_id);
+    if (
+      Number.isInteger(studentUserId) &&
+      studentUserId > 0 &&
+      studentUserId !== payment.payment_user_id
+    ) {
+      await safeNotify(
+        studentUserId,
+        "dispute_status_updated",
+        `Dispute status updated to ${status}.`,
+        id,
+      );
+    }
+
+    res.json({
+      message: "Dispute status updated",
+      dispute: updatedDispute,
+    });
+  }),
+);
+
+/**
+ * Admin resolves dispute
+ * PATCH /api/admin/disputes/:id/resolve
+ * body: { resolution: "release_to_student" | "refund_to_company" | "partial_refund", partial_amount?: number }
+ */
+router.patch(
+  "/disputes/:id/resolve",
+  asyncHandler(async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const { resolution, partial_amount } = req.body ?? {};
+    const normalizedResolution =
+      resolution === "release"
+        ? "release_to_student"
+        : resolution === "refund"
+          ? "refund_to_company"
+          : resolution;
+
+    if (Number.isNaN(id)) {
+      return res.status(400).json({ message: "Invalid dispute id" });
+    }
+
+    const allowed = [
+      "release_to_student",
+      "refund_to_company",
+      "partial_refund",
+    ];
+    if (!allowed.includes(normalizedResolution)) {
+      return res.status(400).json({ message: "Invalid resolution" });
+    }
+
+    if (normalizedResolution === "partial_refund") {
+      const parsedPartial = Number(partial_amount);
+      if (!Number.isFinite(parsedPartial) || parsedPartial <= 0) {
+        return res
+          .status(400)
+          .json({ message: "partial_amount must be a positive number" });
+      }
+    }
+
+    const client = await pool.connect();
+    let updatedDispute;
+    let disputeRow;
+    try {
+      await client.query("BEGIN");
+
+      const disputeResult = await client.query(
+        `
+        SELECT
+          d.*,
+          p.id AS payment_id,
+          p.status AS payment_status,
+          p.amount AS payment_amount,
+          p.user_id AS payment_user_id,
+          p.provider_ref AS payment_provider_ref,
+          p.escrow AS payment_escrow,
+          p.disputed AS payment_disputed,
+          a.user_id AS student_user_id,
+          c.user_id AS company_user_id
         FROM disputes d
         JOIN payments p ON d.payment_id = p.id
         LEFT JOIN applications a ON a.id = p.application_id
@@ -403,46 +564,153 @@ router.patch(
       }
 
       const dispute = disputeResult.rows[0];
-      paymentUserId = dispute.payment_user_id;
+      disputeRow = dispute;
 
-      if (dispute.status !== "open") {
+      if (!["open", "under_review"].includes(dispute.status)) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ message: "Dispute already resolved" });
+        return res.status(400).json({ message: "Dispute already closed" });
       }
 
-      if (dispute.payment_status !== "disputed") {
+      if (dispute.payment_disputed !== true && dispute.payment_status !== "disputed") {
         await client.query("ROLLBACK");
-        return res.status(400).json({
-          message: "Payment is not in disputed state",
-        });
+        return res.status(400).json({ message: "Payment is not under dispute" });
       }
 
-      const targetStatus = resolution === "release" ? "released" : "refunded";
+      const companyUserId = Number(dispute.company_user_id);
+      const studentUserId = Number(dispute.student_user_id);
+
+      if (!Number.isInteger(companyUserId) || companyUserId <= 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Invalid company mapping" });
+      }
+
       const paymentForLedger = {
         id: dispute.payment_id,
         user_id: dispute.payment_user_id,
         amount: dispute.payment_amount,
         status: dispute.payment_status,
-        provider_ref: `payment:${dispute.payment_id}`,
+        provider_ref:
+          dispute.payment_provider_ref ?? `payment:${dispute.payment_id}`,
+        escrow: dispute.payment_escrow,
+        company_user_id: dispute.company_user_id,
+        student_user_id: dispute.student_user_id,
       };
 
-      await applyPaymentTransitionLedger(client, paymentForLedger, targetStatus, {
-        idempotencyPrefix: `payment:${dispute.payment_id}:${dispute.payment_status}->${targetStatus}`,
-        companyUserId: dispute.company_user_id ?? undefined,
-        studentUserId: dispute.student_user_id ?? undefined,
-        requireStudentUserId: targetStatus === "released",
-      });
+      if (normalizedResolution === "release_to_student") {
+        if (
+          dispute.payment_status === "paid" ||
+          dispute.payment_status === "disputed"
+        ) {
+          await applyPaymentTransitionLedger(client, paymentForLedger, "released", {
+            idempotencyPrefix: `payment:${dispute.payment_id}:${dispute.payment_status}->released:dispute`,
+            companyUserId: companyUserId,
+            studentUserId:
+              Number.isInteger(studentUserId) && studentUserId > 0
+                ? studentUserId
+                : undefined,
+            requireStudentUserId: true,
+          });
+        } else if (dispute.payment_status !== "released") {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            message: "Release resolution requires payment in paid/released state",
+          });
+        }
 
-      if (resolution === "release") {
         await client.query(
-          "UPDATE payments SET status = 'released', escrow = false, released_at = NOW() WHERE id = $1",
+          `
+          UPDATE payments
+          SET status = 'released',
+              escrow = false,
+              released_at = COALESCE(released_at, NOW()),
+              disputed = false
+          WHERE id = $1
+          `,
           [dispute.payment_id],
         );
       }
 
-      if (resolution === "refund") {
+      if (normalizedResolution === "refund_to_company") {
+        if (["paid", "released"].includes(dispute.payment_status)) {
+          const refundResult = await applyPaymentRefundLedger(client, paymentForLedger, {
+            idempotencyPrefix: `payment:${dispute.payment_id}:${dispute.payment_status}->refunded:dispute`,
+            companyUserId: companyUserId,
+            studentUserId:
+              Number.isInteger(studentUserId) && studentUserId > 0
+                ? studentUserId
+                : undefined,
+          });
+          await syncWalletAvailableBalances(
+            client,
+            refundResult.walletUserIds ?? [],
+          );
+        } else if (dispute.payment_status === "disputed") {
+          await applyPaymentTransitionLedger(client, paymentForLedger, "refunded", {
+            idempotencyPrefix: `payment:${dispute.payment_id}:${dispute.payment_status}->refunded:dispute_legacy`,
+            companyUserId: companyUserId,
+            studentUserId:
+              Number.isInteger(studentUserId) && studentUserId > 0
+                ? studentUserId
+                : undefined,
+          });
+        } else {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            message: "Refund resolution requires payment in paid/released state",
+          });
+        }
+
         await client.query(
-          "UPDATE payments SET status = 'refunded', escrow = false, refunded_at = NOW() WHERE id = $1",
+          `
+          UPDATE payments
+          SET status = 'refunded',
+              escrow = false,
+              refunded_at = COALESCE(refunded_at, NOW()),
+              disputed = false
+          WHERE id = $1
+          `,
+          [dispute.payment_id],
+        );
+      }
+
+      if (normalizedResolution === "partial_refund") {
+        if (dispute.payment_status !== "released") {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            message: "Partial refund is only supported for released payments",
+          });
+        }
+
+        if (!Number.isInteger(studentUserId) || studentUserId <= 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ message: "Invalid student mapping" });
+        }
+
+        const parsedPartial = Number(partial_amount);
+        const partialResult = await applyPaymentPartialRefundLedger(
+          client,
+          paymentForLedger,
+          {
+            partialAmount: parsedPartial,
+            idempotencyPrefix: `payment:${dispute.payment_id}:${dispute.payment_status}->partial_refund:dispute`,
+            companyUserId: companyUserId,
+            studentUserId: studentUserId,
+          },
+        );
+
+        await syncWalletAvailableBalances(
+          client,
+          partialResult.walletUserIds ?? [],
+        );
+
+        await client.query(
+          `
+          UPDATE payments
+          SET status = 'released',
+              escrow = false,
+              disputed = false
+          WHERE id = $1
+          `,
           [dispute.payment_id],
         );
       }
@@ -451,29 +719,56 @@ router.patch(
         `
         UPDATE disputes
         SET status = 'resolved',
-        resolution = $1,
-        resolved_at = NOW()
+            resolution = $1,
+            resolved_at = NOW()
         WHERE id = $2
         RETURNING *
         `,
-        [resolution, id],
+        [normalizedResolution, id],
       );
 
       updatedDispute = updated.rows[0];
       await client.query("COMMIT");
     } catch (err) {
-      await client.query("ROLLBACK");
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // ignore rollback failure
+      }
       throw err;
     } finally {
       client.release();
     }
 
-    const notifMessage =
-      resolution === "release"
-        ? "Your dispute has been resolved and payment was released to your wallet."
-        : "Your dispute has been resolved and payment was refunded.";
+    const companyNotif =
+      normalizedResolution === "release_to_student"
+        ? "Dispute resolved: payment released to student."
+        : normalizedResolution === "refund_to_company"
+          ? "Dispute resolved: payment refunded to company."
+          : "Dispute resolved: partial refund processed.";
 
-    await safeNotify(paymentUserId, "dispute_resolved", notifMessage, id);
+    await safeNotify(
+      disputeRow.payment_user_id,
+      "dispute_resolved",
+      companyNotif,
+      id,
+    );
+
+    const studentUserId = Number(disputeRow.student_user_id);
+    if (
+      Number.isInteger(studentUserId) &&
+      studentUserId > 0 &&
+      studentUserId !== disputeRow.payment_user_id
+    ) {
+      const studentNotif =
+        normalizedResolution === "release_to_student"
+          ? "Dispute resolved: payment released to your wallet."
+          : normalizedResolution === "refund_to_company"
+            ? "Dispute resolved: payment was refunded to company."
+            : "Dispute resolved: partial refund was processed.";
+
+      await safeNotify(studentUserId, "dispute_resolved", studentNotif, id);
+    }
 
     res.json({
       message: "Dispute resolved successfully",

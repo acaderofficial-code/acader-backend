@@ -45,6 +45,28 @@ router.post(
         return res.status(404).json({ message: "User not found" });
       }
 
+      const disputedPayment = await client.query(
+        `
+        SELECT p.id
+        FROM payments p
+        LEFT JOIN applications a ON a.id = p.application_id
+        WHERE p.disputed = true
+          AND (
+            p.user_id = $1
+            OR a.user_id = $1
+          )
+        LIMIT 1
+        `,
+        [user_id],
+      );
+
+      if (disputedPayment.rows.length > 0) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          message: "Withdrawal blocked: you have a payment under dispute",
+        });
+      }
+
       const availableBalance = await getUserBalanceByType(
         client,
         user_id,

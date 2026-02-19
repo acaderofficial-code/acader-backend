@@ -395,6 +395,71 @@ export const applyPaymentRefundLedger = async (
   };
 };
 
+export const applyPaymentPartialRefundLedger = async (
+  client,
+  payment,
+  options = {},
+) => {
+  if (!payment) {
+    throw new Error("payment is required");
+  }
+
+  if (payment.status !== "released") {
+    throw new Error("Partial refund is only supported for released payments");
+  }
+
+  const partialAmount = toPositiveAmount(options.partialAmount);
+  const totalAmount = toPositiveAmount(payment.amount);
+  if (partialAmount >= totalAmount) {
+    throw new Error("Partial refund amount must be less than payment amount");
+  }
+
+  const companyUserRaw = options.companyUserId ?? payment.company_user_id;
+  const companyUserId = Number(companyUserRaw);
+  if (!Number.isInteger(companyUserId) || companyUserId <= 0) {
+    throw new Error("Invalid company user id for partial refund");
+  }
+
+  const studentUserRaw = options.studentUserId ?? payment.student_user_id;
+  const studentUserId = Number(studentUserRaw);
+  if (!Number.isInteger(studentUserId) || studentUserId <= 0) {
+    throw new Error("Invalid student user id for partial refund");
+  }
+
+  const studentAvailableBalance = await getUserBalanceByType(
+    client,
+    studentUserId,
+    BALANCE_TYPE.AVAILABLE,
+  );
+
+  if (studentAvailableBalance + 0.000001 < partialAmount) {
+    throw new Error("Insufficient student available balance for partial refund");
+  }
+
+  const reference = payment.provider_ref ?? `payment:${payment.id}`;
+  const idempotencyPrefix =
+    options.idempotencyPrefix ??
+    `payment:${payment.id}:${payment.status}->partial_refund:${partialAmount}`;
+
+  const result = await createDoubleEntry(client, {
+    amount: partialAmount,
+    reference,
+    idempotencyBase: `${idempotencyPrefix}:partial_refund`,
+    type: "partial_refund",
+    debitUserId: studentUserId,
+    debitBalanceType: BALANCE_TYPE.AVAILABLE,
+    creditUserId: companyUserId,
+    creditBalanceType: BALANCE_TYPE.AVAILABLE,
+  });
+
+  return {
+    applied: result.applied,
+    refundType: "partial_refund",
+    refundedAmount: partialAmount,
+    walletUserIds: [companyUserId, studentUserId],
+  };
+};
+
 export const applyPaymentTransitionLedger = async (
   client,
   payment,

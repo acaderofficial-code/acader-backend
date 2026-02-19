@@ -14,7 +14,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@prisma/client": "^6.5.0",
+    "@prisma/client": "^7.4.0",
     "axios": "^1.13.3",
     "cloudinary": "^2.9.0",
     "cors": "^2.8.5",
@@ -30,6 +30,6 @@
     "uuid": "^13.0.0"
   },
   "devDependencies": {
-    "prisma": "^6.5.0"
+    "prisma": "^7.4.0"
   }
 }
