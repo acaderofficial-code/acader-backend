@@ -13,13 +13,20 @@ import {
 import { useAuth } from "@/contexts/AuthContext";
 import { apiUrl } from "@/lib/api";
 
+type DisputeStatus = "open" | "under_review" | "resolved" | "rejected";
+type DisputeResolution =
+  | "release_to_student"
+  | "refund_to_company"
+  | "partial_refund"
+  | null;
+
 type Dispute = {
   id: string;
   payment_id: string;
   raised_by: string;
   reason: string;
-  status: "open" | "resolved";
-  resolution: "release" | "refund" | null;
+  status: DisputeStatus;
+  resolution: DisputeResolution;
   created_at: string;
   email: string; // Joined from users table
 };
@@ -64,9 +71,36 @@ export default function DisputesPage() {
     }
   }, [authLoading, isAuthenticated, fetchDisputes]);
 
+  const updateDisputeStatus = async (
+    id: string,
+    status: "under_review" | "rejected",
+  ) => {
+    const key = `${id}-${status}`;
+    setActionLoading(key);
+    try {
+      const res = await fetch(apiUrl(`/api/admin/disputes/${id}/status`), {
+        method: "PATCH",
+        headers: authHeaders({ json: true }),
+        body: JSON.stringify({ status }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.message || "Failed to update dispute status");
+      }
+
+      await fetchDisputes();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Action failed";
+      alert(message);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   const resolveDispute = async (
     id: string,
-    resolution: "release" | "refund",
+    resolution: "release_to_student" | "refund_to_company",
   ) => {
     const key = `${id}-${resolution}`;
     setActionLoading(key);
@@ -90,6 +124,48 @@ export default function DisputesPage() {
       setActionLoading(null);
     }
   };
+
+  const partialRefund = async (id: string) => {
+    const amountInput = window.prompt("Enter partial refund amount (NGN):");
+    if (!amountInput) return;
+
+    const partialAmount = Number(amountInput);
+    if (!Number.isFinite(partialAmount) || partialAmount <= 0) {
+      alert("Enter a valid positive amount.");
+      return;
+    }
+
+    const key = `${id}-partial_refund`;
+    setActionLoading(key);
+    try {
+      const res = await fetch(apiUrl(`/api/admin/disputes/${id}/resolve`), {
+        method: "PATCH",
+        headers: authHeaders({ json: true }),
+        body: JSON.stringify({
+          resolution: "partial_refund",
+          partial_amount: partialAmount,
+        }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.message || "Failed to process partial refund");
+      }
+
+      await fetchDisputes();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Action failed";
+      alert(message);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const isActiveDispute = (status: DisputeStatus) =>
+    status === "open" || status === "under_review";
+
+  const resolutionLabel = (resolution: DisputeResolution) =>
+    resolution ? resolution.replaceAll("_", " ") : "-";
 
   if (authLoading) return <div className="p-10">Loading authentication...</div>;
   if (!isAuthenticated)
@@ -141,6 +217,10 @@ export default function DisputesPage() {
                     className={`px-2 py-1 rounded text-xs font-medium ${
                       dispute.status === "resolved"
                         ? "bg-green-100 text-green-800"
+                        : dispute.status === "rejected"
+                          ? "bg-gray-200 text-gray-800"
+                          : dispute.status === "under_review"
+                            ? "bg-blue-100 text-blue-800"
                         : "bg-yellow-100 text-yellow-800"
                     }`}
                   >
@@ -148,32 +228,71 @@ export default function DisputesPage() {
                   </span>
                 </TableCell>
                 <TableCell>
-                  {dispute.resolution ? (
-                    <span className="capitalize">{dispute.resolution}</span>
-                  ) : (
-                    "-"
-                  )}
+                  <span className="capitalize">{resolutionLabel(dispute.resolution)}</span>
                 </TableCell>
                 <TableCell className="text-right">
-                  {dispute.status === "open" && (
+                  {isActiveDispute(dispute.status) && (
                     <div className="flex justify-end gap-2">
+                      {dispute.status === "open" && (
+                        <button
+                          className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded text-sm disabled:opacity-50"
+                          disabled={actionLoading === `${dispute.id}-under_review`}
+                          onClick={() =>
+                            updateDisputeStatus(dispute.id, "under_review")
+                          }
+                        >
+                          {actionLoading === `${dispute.id}-under_review`
+                            ? "..."
+                            : "Under review"}
+                        </button>
+                      )}
                       <button
                         className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm disabled:opacity-50"
-                        disabled={actionLoading === `${dispute.id}-release`}
-                        onClick={() => resolveDispute(dispute.id, "release")}
+                        disabled={
+                          actionLoading ===
+                          `${dispute.id}-release_to_student`
+                        }
+                        onClick={() =>
+                          resolveDispute(dispute.id, "release_to_student")
+                        }
                       >
-                        {actionLoading === `${dispute.id}-release`
+                        {actionLoading === `${dispute.id}-release_to_student`
                           ? "..."
                           : "Release"}
                       </button>
                       <button
                         className="bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded text-sm disabled:opacity-50"
-                        disabled={actionLoading === `${dispute.id}-refund`}
-                        onClick={() => resolveDispute(dispute.id, "refund")}
+                        disabled={
+                          actionLoading ===
+                          `${dispute.id}-refund_to_company`
+                        }
+                        onClick={() =>
+                          resolveDispute(dispute.id, "refund_to_company")
+                        }
                       >
-                        {actionLoading === `${dispute.id}-refund`
+                        {actionLoading === `${dispute.id}-refund_to_company`
                           ? "..."
                           : "Refund"}
+                      </button>
+                      <button
+                        className="bg-orange-600 hover:bg-orange-700 text-white px-3 py-1.5 rounded text-sm disabled:opacity-50"
+                        disabled={actionLoading === `${dispute.id}-partial_refund`}
+                        onClick={() => partialRefund(dispute.id)}
+                      >
+                        {actionLoading === `${dispute.id}-partial_refund`
+                          ? "..."
+                          : "Partial"}
+                      </button>
+                      <button
+                        className="bg-gray-600 hover:bg-gray-700 text-white px-3 py-1.5 rounded text-sm disabled:opacity-50"
+                        disabled={actionLoading === `${dispute.id}-rejected`}
+                        onClick={() =>
+                          updateDisputeStatus(dispute.id, "rejected")
+                        }
+                      >
+                        {actionLoading === `${dispute.id}-rejected`
+                          ? "..."
+                          : "Reject"}
                       </button>
                     </div>
                   )}

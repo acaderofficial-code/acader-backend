@@ -19,7 +19,7 @@ type Withdrawal = {
   amount: number;
   bank_name: string;
   account_number: string;
-  status: "pending" | "approved" | "rejected";
+  status: "pending" | "processing" | "rejected" | "completed" | "failed";
   created_at: string;
   email: string;
 };
@@ -64,7 +64,7 @@ export default function WithdrawalsPage() {
     }
   }, [authLoading, isAuthenticated, fetchWithdrawals]);
 
-  const updateStatus = async (id: string, status: "approved" | "rejected") => {
+  const updateStatus = async (id: string, status: "processing" | "rejected") => {
     const key = `${id}-${status}`;
     setActionLoading(key);
     try {
@@ -139,10 +139,12 @@ export default function WithdrawalsPage() {
                 <TableCell>
                   <span
                     className={`px-2 py-1 rounded text-xs font-medium ${
-                      w.status === "approved"
+                      w.status === "completed"
                         ? "bg-green-100 text-green-800"
-                        : w.status === "rejected"
+                        : w.status === "rejected" || w.status === "failed"
                           ? "bg-red-100 text-red-800"
+                          : w.status === "processing"
+                            ? "bg-blue-100 text-blue-800"
                           : "bg-yellow-100 text-yellow-800"
                     }`}
                   >
@@ -157,10 +159,10 @@ export default function WithdrawalsPage() {
                     <div className="flex justify-end gap-2">
                       <button
                         className="bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded text-sm disabled:opacity-50"
-                        disabled={actionLoading === `${w.id}-approved`}
-                        onClick={() => updateStatus(w.id, "approved")}
+                        disabled={actionLoading === `${w.id}-processing`}
+                        onClick={() => updateStatus(w.id, "processing")}
                       >
-                        {actionLoading === `${w.id}-approved`
+                        {actionLoading === `${w.id}-processing`
                           ? "..."
                           : "Approve"}
                       </button>

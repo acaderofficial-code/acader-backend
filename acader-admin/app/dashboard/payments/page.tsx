@@ -54,19 +54,43 @@ export default function PaymentsPage() {
     }
   }, [authLoading, isAuthenticated, fetchPayments]);
 
-  const updateStatus = async (id: number, status: string) => {
-    const key = `${id}-${status}`;
+  const releasePayment = async (id: number) => {
+    const key = `${id}-released`;
     setActionLoading(key);
     try {
       const res = await fetch(apiUrl(`/api/payments/${id}/status`), {
         method: "PATCH",
         headers: authHeaders({ json: true }),
-        body: JSON.stringify({ status }),
+        body: JSON.stringify({ status: "released" }),
       });
 
       if (!res.ok) {
         const data = await res.json();
-        throw new Error(data.message || "Failed to update status");
+        throw new Error(data.message || "Failed to release payment");
+      }
+
+      await fetchPayments();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Action failed";
+      alert(message);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const refundPayment = async (id: number) => {
+    const key = `${id}-refund`;
+    setActionLoading(key);
+    try {
+      const res = await fetch(apiUrl(`/api/payments/${id}/refund`), {
+        method: "POST",
+        headers: authHeaders({ json: true }),
+        body: JSON.stringify({ reason: "Admin refund" }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.message || "Failed to refund payment");
       }
 
       await fetchPayments();
@@ -122,7 +146,7 @@ export default function PaymentsPage() {
     <div className="container mx-auto py-10">
       <h1 className="text-2xl font-bold mb-5">Payments</h1>
       <Table>
-        <TableCaption>A list of your recent payments.</TableCaption>
+        <TableCaption>A list of all payments.</TableCaption>
         <TableHeader>
           <TableRow>
             <TableHead className="w-[100px]">ID</TableHead>
@@ -130,6 +154,7 @@ export default function PaymentsPage() {
             <TableHead>Amount</TableHead>
             <TableHead>Status</TableHead>
             <TableHead>Escrow</TableHead>
+            <TableHead>Disputed</TableHead>
             <TableHead>Created At</TableHead>
             <TableHead className="text-right">Actions</TableHead>
           </TableRow>
@@ -137,7 +162,7 @@ export default function PaymentsPage() {
         <TableBody>
           {payments.length === 0 ? (
             <TableRow>
-              <TableCell colSpan={7} className="text-center">
+              <TableCell colSpan={8} className="text-center">
                 No payments found.
               </TableCell>
             </TableRow>
@@ -150,70 +175,71 @@ export default function PaymentsPage() {
                 <TableCell>{payment.status}</TableCell>
                 <TableCell>{payment.escrow ? "Yes" : "No"}</TableCell>
                 <TableCell>
+                  <span
+                    className={`px-2 py-1 rounded text-xs font-medium ${
+                      payment.disputed
+                        ? "bg-red-100 text-red-800"
+                        : "bg-green-100 text-green-800"
+                    }`}
+                  >
+                    {payment.disputed ? "Yes" : "No"}
+                  </span>
+                </TableCell>
+                <TableCell>
                   {new Date(payment.created_at).toLocaleDateString()}
                 </TableCell>
                 <TableCell className="text-right">
                   <div className="flex justify-end gap-2">
-                    {/* paid → released, refunded */}
-                    {payment.status === "paid" && (
+                    {payment.disputed ? (
+                      <span className="text-xs text-red-700 font-medium">
+                        Frozen by dispute
+                      </span>
+                    ) : (
                       <>
-                        <button
-                          className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm disabled:opacity-50"
-                          disabled={actionLoading === `${payment.id}-released`}
-                          onClick={() => updateStatus(payment.id, "released")}
-                        >
-                          {actionLoading === `${payment.id}-released`
-                            ? "..."
-                            : "Release"}
-                        </button>
-                        <button
-                          className="bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded text-sm disabled:opacity-50"
-                          disabled={actionLoading === `${payment.id}-refunded`}
-                          onClick={() => updateStatus(payment.id, "refunded")}
-                        >
-                          {actionLoading === `${payment.id}-refunded`
-                            ? "..."
-                            : "Refund"}
-                        </button>
-                      </>
-                    )}
+                        {payment.status === "paid" && (
+                          <button
+                            className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm disabled:opacity-50"
+                            disabled={actionLoading === `${payment.id}-released`}
+                            onClick={() => releasePayment(payment.id)}
+                          >
+                            {actionLoading === `${payment.id}-released`
+                              ? "..."
+                              : "Release"}
+                          </button>
+                        )}
 
-                    {/* released → disputed */}
-                    {payment.status === "released" && (
-                      <>
-                        <button
-                          className="bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-1.5 rounded text-sm border disabled:opacity-50"
-                          disabled={actionLoading === `${payment.id}-dispute`}
-                          onClick={() => openDispute(payment.id)}
-                        >
-                          {actionLoading === `${payment.id}-dispute`
-                            ? "..."
-                            : "Dispute"}
-                        </button>
-                      </>
-                    )}
+                        {(payment.status === "paid" ||
+                          payment.status === "released") && (
+                          <button
+                            className="bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded text-sm disabled:opacity-50"
+                            disabled={actionLoading === `${payment.id}-refund`}
+                            onClick={() => refundPayment(payment.id)}
+                          >
+                            {actionLoading === `${payment.id}-refund`
+                              ? "..."
+                              : "Refund"}
+                          </button>
+                        )}
 
-                    {/* disputed → released, refunded */}
-                    {payment.status === "disputed" && (
-                      <>
-                        <button
-                          className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm disabled:opacity-50"
-                          disabled={actionLoading === `${payment.id}-released`}
-                          onClick={() => updateStatus(payment.id, "released")}
-                        >
-                          {actionLoading === `${payment.id}-released`
-                            ? "..."
-                            : "Release"}
-                        </button>
-                        <button
-                          className="bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded text-sm disabled:opacity-50"
-                          disabled={actionLoading === `${payment.id}-refunded`}
-                          onClick={() => updateStatus(payment.id, "refunded")}
-                        >
-                          {actionLoading === `${payment.id}-refunded`
-                            ? "..."
-                            : "Refund"}
-                        </button>
+                        {(payment.status === "paid" ||
+                          payment.status === "released") && (
+                          <button
+                            className="bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-1.5 rounded text-sm border disabled:opacity-50"
+                            disabled={actionLoading === `${payment.id}-dispute`}
+                            onClick={() => openDispute(payment.id)}
+                          >
+                            {actionLoading === `${payment.id}-dispute`
+                              ? "..."
+                              : "Dispute"}
+                          </button>
+                        )}
+
+                        {payment.status !== "paid" &&
+                          payment.status !== "released" && (
+                            <span className="text-xs text-gray-500">
+                              No actions
+                            </span>
+                          )}
                       </>
                     )}
                   </div>
