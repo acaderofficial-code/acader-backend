@@ -6,6 +6,7 @@ import {
   releaseWithdrawalHold,
   settleWithdrawal,
 } from "../services/ledger.service.js";
+import { refreshRiskProfilesForUsers } from "../services/fraud/risk_profile.js";
 
 const router = express.Router();
 
@@ -425,6 +426,11 @@ router.post("/paystack", async (req, res) => {
           paymentId: payment.id,
           disputeId,
         });
+
+        await refreshRiskProfilesForUsers([
+          Number(payment.user_id),
+          Number(payment.student_user_id),
+        ]);
 
         try {
           await pool.query(

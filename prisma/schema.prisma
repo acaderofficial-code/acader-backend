@@ -100,3 +100,17 @@ model FraudFlag {
 
   @@map("fraud_flags")
 }
+
+model UserRiskProfile {
+  userId               Int      @id @map("user_id")
+  totalWithdrawals     Int      @default(0) @map("total_withdrawals")
+  totalReleases        Int      @default(0) @map("total_releases")
+  disputesCount        Int      @default(0) @map("disputes_count")
+  avgTimeToWithdrawal  Float?   @map("avg_time_to_withdrawal")
+  withdrawalVelocity   Float?   @map("withdrawal_velocity")
+  lastActivityAt       DateTime? @map("last_activity_at")
+  riskScore            Int      @default(0) @map("risk_score")
+  updatedAt            DateTime @default(now()) @map("updated_at")
+
+  @@map("user_risk_profiles")
+}

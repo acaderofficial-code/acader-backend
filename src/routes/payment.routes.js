@@ -15,6 +15,7 @@ import {
   applyPaymentTransitionLedger,
   syncWalletAvailableBalances,
 } from "../services/ledger.service.js";
+import { refreshRiskProfilesForUsers } from "../services/fraud/risk_profile.js";
 
 const router = express.Router();
 
@@ -724,6 +725,8 @@ router.post(
         id,
       );
     }
+
+    await refreshRiskProfilesForUsers([pay.user_id, studentUserId]);
 
     res.status(201).json({
       message: "Dispute raised successfully",

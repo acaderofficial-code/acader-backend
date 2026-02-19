@@ -10,9 +10,30 @@ import {
   releaseWithdrawalHold,
 } from "../services/ledger.service.js";
 import { evaluateWithdrawalRisk } from "../services/fraud/risk_rules.js";
+import {
+  createBehaviourRiskFlag,
+  updateUserRiskProfile,
+} from "../services/fraud/risk_profile.js";
+import { BEHAVIOURAL_RISK_THRESHOLD } from "../services/fraud/risk_score.js";
 
 const router = express.Router();
 const FRAUD_BLOCK_THRESHOLD = 60;
+
+const notifyAdminsOfFraud = async (client, message) => {
+  const adminRows = await client.query(
+    "SELECT id FROM users WHERE role = 'admin' ORDER BY id ASC",
+  );
+
+  for (const admin of adminRows.rows) {
+    await client.query(
+      `
+      INSERT INTO notifications (user_id, title, message, type)
+      VALUES ($1, $2, $3, $4)
+      `,
+      [admin.id, "Suspicious Withdrawal Attempt", message, "fraud_alert"],
+    );
+  }
+};
 
 /**
  * User requests withdrawal (authenticated; user_id from token)
@@ -79,6 +100,50 @@ router.post(
         return res.status(400).json({ message: "Insufficient balance" });
       }
 
+      const behavioural = await updateUserRiskProfile(user_id, {
+        client,
+      });
+      const behaviouralScore = Number(
+        behavioural.profile?.risk_score ?? behavioural.score?.riskScore ?? 0,
+      );
+
+      if (behaviouralScore > BEHAVIOURAL_RISK_THRESHOLD) {
+        const metadata = {
+          withdrawalAmount: normalizedAmount,
+          timestamp: new Date().toISOString(),
+          triggeredSignals: behavioural.score?.triggeredSignals ?? [],
+          features: behavioural.features,
+          threshold: BEHAVIOURAL_RISK_THRESHOLD,
+        };
+
+        await createBehaviourRiskFlag(
+          user_id,
+          behaviouralScore,
+          metadata,
+          { client },
+        );
+
+        await notifyAdminsOfFraud(
+          client,
+          `User ${user_id} withdrawal blocked by behavioural risk model`,
+        );
+
+        console.error(`🚨 Fraud Risk Triggered for userId ${user_id}`);
+        console.error("Rules:");
+        console.error(["AI_RISK_THRESHOLD_EXCEEDED"]);
+        console.error(`Score: ${behaviouralScore}`);
+
+        await client.query("COMMIT");
+        return res.status(403).json({
+          message: "Withdrawal blocked due to high behavioural risk.",
+          risk: {
+            riskScore: behaviouralScore,
+            triggeredRules: ["AI_RISK_THRESHOLD_EXCEEDED"],
+            triggeredSignals: behavioural.score?.triggeredSignals ?? [],
+          },
+        });
+      }
+
       const risk = await evaluateWithdrawalRisk(user_id, normalizedAmount, {
         client,
       });
@@ -99,24 +164,10 @@ router.post(
           [user_id, rulesText, risk.riskScore, JSON.stringify(metadata)],
         );
 
-        const adminRows = await client.query(
-          "SELECT id FROM users WHERE role = 'admin' ORDER BY id ASC",
+        await notifyAdminsOfFraud(
+          client,
+          `User ${user_id} withdrawal flagged by fraud engine`,
         );
-
-        for (const admin of adminRows.rows) {
-          await client.query(
-            `
-            INSERT INTO notifications (user_id, title, message, type)
-            VALUES ($1, $2, $3, $4)
-            `,
-            [
-              admin.id,
-              "Suspicious Withdrawal Attempt",
-              `User ${user_id} withdrawal flagged by fraud engine`,
-              "fraud_alert",
-            ],
-          );
-        }
 
         console.error(`🚨 Fraud Risk Triggered for userId ${user_id}`);
         console.error("Rules:");

@@ -1,4 +1,5 @@
 import pool from "../config/db.js";
+import { refreshRiskProfilesForUsers } from "./fraud/risk_profile.js";
 
 const DIRECTION = {
   CREDIT: "credit",
@@ -282,11 +283,13 @@ export const applyPaymentRefundLedger = async (
       creditUserId: companyUserId,
       creditBalanceType: BALANCE_TYPE.AVAILABLE,
     });
+    const walletUserIds = [companyUserId];
+    await refreshRiskProfilesForUsers(walletUserIds, { client });
 
     return {
       applied: result.applied,
       refundType: REFUND_TYPE.ESCROW,
-      walletUserIds: [companyUserId],
+      walletUserIds,
     };
   }
 
@@ -396,10 +399,13 @@ export const applyPaymentRefundLedger = async (
     );
   }
 
+  const walletUserIds = [companyUserId, studentUserId];
+  await refreshRiskProfilesForUsers(walletUserIds, { client });
+
   return {
     applied: insertStates[0] ?? false,
     refundType: REFUND_TYPE.RELEASED,
-    walletUserIds: [companyUserId, studentUserId],
+    walletUserIds,
   };
 };
 
@@ -460,11 +466,14 @@ export const applyPaymentPartialRefundLedger = async (
     creditBalanceType: BALANCE_TYPE.AVAILABLE,
   });
 
+  const walletUserIds = [companyUserId, studentUserId];
+  await refreshRiskProfilesForUsers(walletUserIds, { client });
+
   return {
     applied: result.applied,
     refundType: "partial_refund",
     refundedAmount: partialAmount,
-    walletUserIds: [companyUserId, studentUserId],
+    walletUserIds,
   };
 };
 
@@ -686,6 +695,7 @@ export const applyPaymentTransitionLedger = async (
 
   if (walletUserIds.length > 0) {
     await syncWalletAvailableBalances(client, walletUserIds);
+    await refreshRiskProfilesForUsers(walletUserIds, { client });
   }
 
   return { applied: result.applied, walletUserIds };
@@ -707,6 +717,7 @@ export const createWithdrawalHold = async (client, withdrawal) => {
   });
 
   await syncWalletAvailableBalances(client, [userId]);
+  await refreshRiskProfilesForUsers([userId], { client });
   return result;
 };
 
@@ -734,12 +745,13 @@ export const releaseWithdrawalHold = async (
   });
 
   await syncWalletAvailableBalances(client, [userId]);
+  await refreshRiskProfilesForUsers([userId], { client });
   return result;
 };
 
 export const settleWithdrawal = async (client, withdrawal) => {
   const amount = toPositiveAmount(withdrawal.amount);
-  return createDoubleEntry(client, {
+  const result = await createDoubleEntry(client, {
     amount,
     type: "withdrawal_complete",
     reference: `withdrawal_${withdrawal.id}`,
@@ -749,6 +761,8 @@ export const settleWithdrawal = async (client, withdrawal) => {
     creditUserId: withdrawal.user_id,
     creditBalanceType: BALANCE_TYPE.PAYOUT,
   });
+  await refreshRiskProfilesForUsers([withdrawal.user_id], { client });
+  return result;
 };
 
 export const BALANCE_TYPES = BALANCE_TYPE;
