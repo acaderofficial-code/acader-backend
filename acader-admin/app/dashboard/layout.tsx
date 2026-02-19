@@ -73,6 +73,20 @@ export default function DashboardLayout({
           >
             Withdrawals
           </Link>
+
+          <Link
+            href="/dashboard/ledger"
+            className="rounded px-3 py-2 hover:bg-gray-800"
+          >
+            Ledger
+          </Link>
+
+          <Link
+            href="/dashboard/webhooks"
+            className="rounded px-3 py-2 hover:bg-gray-800"
+          >
+            Webhooks
+          </Link>
         </nav>
 
         <button

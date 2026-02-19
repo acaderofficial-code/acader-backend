@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState, useCallback } from "react";
 import {
   Table,
@@ -199,8 +200,22 @@ export default function DisputesPage() {
           ) : (
             disputes.map((dispute) => (
               <TableRow key={dispute.id}>
-                <TableCell className="font-medium">{dispute.id}</TableCell>
-                <TableCell>{dispute.payment_id}</TableCell>
+                <TableCell className="font-medium">
+                  <Link
+                    className="text-blue-600 hover:underline"
+                    href={`/dashboard/disputes/${dispute.id}`}
+                  >
+                    {dispute.id}
+                  </Link>
+                </TableCell>
+                <TableCell>
+                  <Link
+                    className="text-blue-600 hover:underline"
+                    href={`/dashboard/payments/${dispute.payment_id}`}
+                  >
+                    {dispute.payment_id}
+                  </Link>
+                </TableCell>
                 <TableCell>
                   <div className="flex flex-col">
                     <span className="text-xs text-gray-500">

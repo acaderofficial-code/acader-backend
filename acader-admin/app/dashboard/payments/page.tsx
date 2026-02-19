@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState, useCallback } from "react";
 import {
   Table,
@@ -169,7 +170,14 @@ export default function PaymentsPage() {
           ) : (
             payments.map((payment) => (
               <TableRow key={payment.id}>
-                <TableCell className="font-medium">{payment.id}</TableCell>
+                <TableCell className="font-medium">
+                  <Link
+                    className="text-blue-600 hover:underline"
+                    href={`/dashboard/payments/${payment.id}`}
+                  >
+                    {payment.id}
+                  </Link>
+                </TableCell>
                 <TableCell>{payment.user_id}</TableCell>
                 <TableCell>{payment.amount}</TableCell>
                 <TableCell>{payment.status}</TableCell>

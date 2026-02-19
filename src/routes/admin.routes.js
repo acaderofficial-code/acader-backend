@@ -105,6 +105,86 @@ router.get(
 );
 
 /**
+ * View webhook events (admin only)
+ * GET /api/admin/webhooks
+ * Query params:
+ * - provider
+ * - event_type
+ * - reference
+ * - limit (default 100, max 500)
+ * - offset (default 0)
+ */
+router.get(
+  "/webhooks",
+  asyncHandler(async (req, res) => {
+    const {
+      provider,
+      event_type,
+      reference,
+      limit = "100",
+      offset = "0",
+    } = req.query;
+
+    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+    const parsedOffset = Math.max(parseInt(offset, 10) || 0, 0);
+
+    const filters = [];
+    const values = [];
+
+    if (provider) {
+      values.push(provider);
+      filters.push(`provider = $${values.length}`);
+    }
+
+    if (event_type) {
+      values.push(event_type);
+      filters.push(`event_type = $${values.length}`);
+    }
+
+    if (reference) {
+      values.push(`%${reference}%`);
+      filters.push(`reference ILIKE $${values.length}`);
+    }
+
+    const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const eventsQuery = `
+      SELECT id, provider, event_id, event_type, reference, payload, received_at
+      FROM webhook_events
+      ${whereClause}
+      ORDER BY received_at DESC
+      LIMIT $${values.length + 1}
+      OFFSET $${values.length + 2}
+    `;
+
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM webhook_events
+      ${whereClause}
+    `;
+
+    const [eventsResult, countResult] = await Promise.all([
+      pool.query(eventsQuery, [...values, parsedLimit, parsedOffset]),
+      pool.query(countQuery, values),
+    ]);
+
+    res.json({
+      filters: {
+        provider: provider ?? null,
+        event_type: event_type ?? null,
+        reference: reference ?? null,
+      },
+      pagination: {
+        limit: parsedLimit,
+        offset: parsedOffset,
+        total: countResult.rows[0]?.total ?? 0,
+      },
+      events: eventsResult.rows,
+    });
+  }),
+);
+
+/**
  * Ledger report (admin only)
  * GET /api/admin/reports/ledger
  * Query params:
