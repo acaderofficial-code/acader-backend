@@ -1,5 +1,9 @@
 import pool from "../config/db.js";
 import { refreshRiskProfilesForUsers } from "./fraud/risk_profile.js";
+import {
+  appendFinancialEventLog,
+  FINANCIAL_EVENT_TYPE,
+} from "./financial_event_log.service.js";
 
 const DIRECTION = {
   CREDIT: "credit",
@@ -113,10 +117,44 @@ export const createLedgerEntry = async (client, entry) => {
     ],
   );
 
-  return {
-    inserted: result.rowCount === 1,
-    row: result.rows[0] ?? null,
-  };
+  const inserted = result.rowCount === 1;
+  const row = result.rows[0] ?? null;
+
+  if (inserted && row) {
+    await appendFinancialEventLog(
+      {
+        eventType: FINANCIAL_EVENT_TYPE.LEDGER_ENTRY_CREATED,
+        userId: userId ?? null,
+        eventPayload: {
+          ledger_entry_id: row.id,
+          amount: row.amount,
+          direction: row.direction,
+          balance_type: row.balance_type,
+          type: row.type,
+          reference: row.reference,
+          idempotency_key: row.idempotency_key,
+        },
+      },
+      { client },
+    );
+
+    if (type === "platform_fee") {
+      await appendFinancialEventLog(
+        {
+          eventType: FINANCIAL_EVENT_TYPE.PLATFORM_FEE_DEDUCTED,
+          userId: userId ?? null,
+          eventPayload: {
+            amount: row.amount,
+            reference: row.reference,
+            ledger_entry_id: row.id,
+          },
+        },
+        { client },
+      );
+    }
+  }
+
+  return { inserted, row };
 };
 
 export const createDoubleEntry = async (client, params) => {
@@ -247,6 +285,30 @@ export const getUserBalanceByType = async (
   return Number(result.rows[0]?.balance ?? 0);
 };
 
+const getReferenceEscrowBalance = async (client, userId, reference) => {
+  const result = await client.query(
+    `
+    SELECT COALESCE(
+      SUM(
+        CASE
+          WHEN direction = 'credit' THEN amount
+          WHEN direction = 'debit' THEN -amount
+          ELSE 0
+        END
+      ),
+      0
+    ) AS balance
+    FROM ledger_entries
+    WHERE user_id = $1
+      AND balance_type = 'escrow'
+      AND reference = $2
+    `,
+    [userId, reference],
+  );
+
+  return Number(result.rows[0]?.balance ?? 0);
+};
+
 export const applyPaymentRefundLedger = async (
   client,
   payment,
@@ -273,6 +335,28 @@ export const applyPaymentRefundLedger = async (
   }
 
   if (fromStatus === "paid") {
+    const escrowBalanceForReference = await getReferenceEscrowBalance(
+      client,
+      companyUserId,
+      reference,
+    );
+    const shortfall = roundToCurrency(amount - escrowBalanceForReference);
+
+    // Legacy refunds can exist without an original escrow_hold ledger entry.
+    // Backfill escrow for this payment reference before applying refund debits.
+    if (shortfall > 0.000001) {
+      await createDoubleEntry(client, {
+        amount: shortfall,
+        reference,
+        idempotencyBase: `${idempotencyPrefix}:legacy_escrow_backfill`,
+        type: "escrow_backfill",
+        debitUserId: null,
+        debitBalanceType: BALANCE_TYPE.PLATFORM,
+        creditUserId: companyUserId,
+        creditBalanceType: BALANCE_TYPE.ESCROW,
+      });
+    }
+
     const result = await createDoubleEntry(client, {
       amount,
       reference,
@@ -285,6 +369,23 @@ export const applyPaymentRefundLedger = async (
     });
     const walletUserIds = [companyUserId];
     await refreshRiskProfilesForUsers(walletUserIds, { client });
+
+    if (result.applied) {
+      await appendFinancialEventLog(
+        {
+          eventType: FINANCIAL_EVENT_TYPE.REFUND_PROCESSED,
+          userId: companyUserId,
+          paymentId: payment.id,
+          eventPayload: {
+            refund_type: REFUND_TYPE.ESCROW,
+            amount,
+            from_status: fromStatus,
+            reference,
+          },
+        },
+        { client },
+      );
+    }
 
     return {
       applied: result.applied,
@@ -401,6 +502,25 @@ export const applyPaymentRefundLedger = async (
 
   const walletUserIds = [companyUserId, studentUserId];
   await refreshRiskProfilesForUsers(walletUserIds, { client });
+
+  if (insertStates[0] ?? false) {
+    await appendFinancialEventLog(
+      {
+        eventType: FINANCIAL_EVENT_TYPE.REFUND_PROCESSED,
+        userId: companyUserId,
+        paymentId: payment.id,
+        eventPayload: {
+          refund_type: REFUND_TYPE.RELEASED,
+          amount,
+          from_status: fromStatus,
+          reference,
+          student_debit_amount: studentDebitAmount,
+          revenue_debit_amount: revenueDebitAmount,
+        },
+      },
+      { client },
+    );
+  }
 
   return {
     applied: insertStates[0] ?? false,
@@ -617,6 +737,22 @@ export const applyPaymentTransitionLedger = async (
         creditBalanceType: BALANCE_TYPE.ESCROW,
       });
       walletUserIds.push(companyUserId);
+      if (result.applied) {
+        await appendFinancialEventLog(
+          {
+            eventType: FINANCIAL_EVENT_TYPE.ESCROW_FUNDED,
+            userId: companyUserId,
+            paymentId: payment.id,
+            eventPayload: {
+              amount,
+              reference,
+              from_wallet: "platform",
+              to_wallet: "escrow",
+            },
+          },
+          { client },
+        );
+      }
       break;
     case "paid->released":
       ensureStudentRecipient(true);
@@ -627,6 +763,24 @@ export const applyPaymentTransitionLedger = async (
         studentUserId,
       });
       walletUserIds.push(companyUserId, studentUserId);
+      if (result.applied) {
+        await appendFinancialEventLog(
+          {
+            eventType: FINANCIAL_EVENT_TYPE.ESCROW_RELEASED,
+            userId: studentUserId,
+            paymentId: payment.id,
+            eventPayload: {
+              amount,
+              reference,
+              from_wallet: "escrow",
+              to_wallet: "available",
+              student_amount: result.studentNetAmount,
+              platform_fee: result.feeAmount,
+            },
+          },
+          { client },
+        );
+      }
       break;
     case "released->disputed":
       ensureStudentRecipient(true);
@@ -661,6 +815,24 @@ export const applyPaymentTransitionLedger = async (
         studentUserId,
       });
       walletUserIds.push(disputedFundsUserId, studentUserId);
+      if (result.applied) {
+        await appendFinancialEventLog(
+          {
+            eventType: FINANCIAL_EVENT_TYPE.ESCROW_RELEASED,
+            userId: studentUserId,
+            paymentId: payment.id,
+            eventPayload: {
+              amount,
+              reference,
+              from_wallet: "locked",
+              to_wallet: "available",
+              student_amount: result.studentNetAmount,
+              platform_fee: result.feeAmount,
+            },
+          },
+          { client },
+        );
+      }
       break;
     case "paid->refunded":
       result = await applyPaymentRefundLedger(client, payment, {
@@ -688,6 +860,22 @@ export const applyPaymentTransitionLedger = async (
         creditUserId: null,
         creditBalanceType: BALANCE_TYPE.PLATFORM,
       });
+      if (result.applied) {
+        await appendFinancialEventLog(
+          {
+            eventType: FINANCIAL_EVENT_TYPE.REFUND_PROCESSED,
+            userId: companyUserId,
+            paymentId: payment.id,
+            eventPayload: {
+              refund_type: "disputed_refund",
+              amount,
+              from_status: fromStatus,
+              reference,
+            },
+          },
+          { client },
+        );
+      }
       break;
     default:
       return { applied: false, walletUserIds: [] };
