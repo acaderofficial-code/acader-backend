@@ -74,3 +74,29 @@ model ReconciliationFlag {
 
   @@map("reconciliation_flags")
 }
+
+model SettlementReport {
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reportDate          DateTime @unique @map("report_date") @db.Date
+  escrowInflow        Decimal  @default(0) @map("escrow_inflow") @db.Decimal(14, 2)
+  releasedToStudents  Decimal  @default(0) @map("released_to_students") @db.Decimal(14, 2)
+  refundedToCompanies Decimal  @default(0) @map("refunded_to_companies") @db.Decimal(14, 2)
+  withdrawals         Decimal  @default(0) @db.Decimal(14, 2)
+  platformFees        Decimal  @default(0) @map("platform_fees") @db.Decimal(14, 2)
+  systemAvailableTotal Decimal @default(0) @map("system_available_total") @db.Decimal(14, 2)
+  systemEscrowTotal   Decimal  @default(0) @map("system_escrow_total") @db.Decimal(14, 2)
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  @@map("settlement_reports")
+}
+
+model FraudFlag {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        Int      @map("user_id")
+  ruleTriggered String   @map("rule_triggered")
+  riskScore     Int      @map("risk_score")
+  metadata      Json?
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@map("fraud_flags")
+}

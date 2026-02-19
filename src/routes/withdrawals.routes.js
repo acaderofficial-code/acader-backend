@@ -9,8 +9,10 @@ import {
   getUserBalanceByType,
   releaseWithdrawalHold,
 } from "../services/ledger.service.js";
+import { evaluateWithdrawalRisk } from "../services/fraud/risk_rules.js";
 
 const router = express.Router();
+const FRAUD_BLOCK_THRESHOLD = 60;
 
 /**
  * User requests withdrawal (authenticated; user_id from token)
@@ -75,6 +77,60 @@ router.post(
       if (availableBalance < normalizedAmount) {
         await client.query("ROLLBACK");
         return res.status(400).json({ message: "Insufficient balance" });
+      }
+
+      const risk = await evaluateWithdrawalRisk(user_id, normalizedAmount, {
+        client,
+      });
+
+      if (risk.riskScore >= FRAUD_BLOCK_THRESHOLD) {
+        const rulesText = risk.triggeredRules.join(",");
+        const metadata = {
+          ...risk.metadata,
+          withdrawalAmount: normalizedAmount,
+          timestamp: new Date().toISOString(),
+        };
+
+        await client.query(
+          `
+          INSERT INTO fraud_flags (user_id, rule_triggered, risk_score, metadata)
+          VALUES ($1, $2, $3, $4::jsonb)
+          `,
+          [user_id, rulesText, risk.riskScore, JSON.stringify(metadata)],
+        );
+
+        const adminRows = await client.query(
+          "SELECT id FROM users WHERE role = 'admin' ORDER BY id ASC",
+        );
+
+        for (const admin of adminRows.rows) {
+          await client.query(
+            `
+            INSERT INTO notifications (user_id, title, message, type)
+            VALUES ($1, $2, $3, $4)
+            `,
+            [
+              admin.id,
+              "Suspicious Withdrawal Attempt",
+              `User ${user_id} withdrawal flagged by fraud engine`,
+              "fraud_alert",
+            ],
+          );
+        }
+
+        console.error(`🚨 Fraud Risk Triggered for userId ${user_id}`);
+        console.error("Rules:");
+        console.error(risk.triggeredRules);
+        console.error(`Score: ${risk.riskScore}`);
+
+        await client.query("COMMIT");
+        return res.status(403).json({
+          message: "Withdrawal under review due to risk detection.",
+          risk: {
+            riskScore: risk.riskScore,
+            triggeredRules: risk.triggeredRules,
+          },
+        });
       }
 
       const withdrawal = await client.query(
