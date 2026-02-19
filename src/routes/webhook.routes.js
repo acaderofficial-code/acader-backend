@@ -17,6 +17,10 @@ import {
   createRiskAuditLog,
   RISK_AUDIT_ACTION,
 } from "../services/fraud/risk_audit.js";
+import {
+  appendFinancialEventLog,
+  FINANCIAL_EVENT_TYPE,
+} from "../services/financial_event_log.service.js";
 
 const router = express.Router();
 
@@ -387,6 +391,16 @@ router.post("/paystack", async (req, res) => {
               reason: "STUDENT_RESTRICTED",
               relatedPaymentId: payment.id,
             });
+            await appendFinancialEventLog({
+              eventType: FINANCIAL_EVENT_TYPE.ESCROW_RELEASE_REJECTED,
+              userId: studentUserId,
+              paymentId: payment.id,
+              eventPayload: {
+                reason: "STUDENT_RESTRICTED",
+                source: "paystack_webhook",
+                restriction_reason: restriction.reason ?? null,
+              },
+            });
           } catch (auditErr) {
             console.error("[risk_audit] webhook release rejection log failed", auditErr.message);
           }
@@ -466,6 +480,19 @@ router.post("/paystack", async (req, res) => {
           },
           { client },
         );
+        await appendFinancialEventLog(
+          {
+            eventType: FINANCIAL_EVENT_TYPE.DISPUTE_OPENED,
+            userId: payment.user_id,
+            paymentId: payment.id,
+            disputeId,
+            eventPayload: {
+              reason,
+              source: "paystack_webhook",
+            },
+          },
+          { client },
+        );
         const disputeStudentUserId = Number(payment.student_user_id);
         if (
           Number.isInteger(disputeStudentUserId) &&
@@ -478,6 +505,19 @@ router.post("/paystack", async (req, res) => {
               actionType: RISK_AUDIT_ACTION.DISPUTE_OPENED,
               reason: "PAYSTACK_DISPUTE_WEBHOOK",
               relatedPaymentId: payment.id,
+            },
+            { client },
+          );
+          await appendFinancialEventLog(
+            {
+              eventType: FINANCIAL_EVENT_TYPE.DISPUTE_OPENED,
+              userId: disputeStudentUserId,
+              paymentId: payment.id,
+              disputeId,
+              eventPayload: {
+                reason,
+                source: "paystack_webhook",
+              },
             },
             { client },
           );
@@ -595,6 +635,19 @@ router.post("/paystack", async (req, res) => {
         notification_user_id: notificationUserId,
       };
       if (eventName === "transfer.success") {
+        await appendFinancialEventLog(
+          {
+            eventType: FINANCIAL_EVENT_TYPE.ESCROW_RELEASED,
+            userId: notificationUserId,
+            paymentId: payment.id,
+            eventPayload: {
+              source: "paystack_webhook",
+              reference,
+              amount: payment.amount,
+            },
+          },
+          { client },
+        );
         await createRiskAuditLog(
           {
             userId: notificationUserId,

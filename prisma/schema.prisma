@@ -152,3 +152,18 @@ model RiskAuditLog {
 
   @@map("risk_audit_logs")
 }
+
+model FinancialEventLog {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  eventType     String   @map("event_type")
+  userId        Int?     @map("user_id")
+  paymentId     Int?     @map("payment_id")
+  withdrawalId  Int?     @map("withdrawal_id")
+  disputeId     Int?     @map("dispute_id")
+  eventPayload  Json     @map("event_payload")
+  previousHash  String   @map("previous_hash")
+  currentHash   String   @map("current_hash")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@map("financial_event_log")
+}

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState, useCallback } from "react";
 import {
   Table,
@@ -78,12 +79,13 @@ export default function UsersPage() {
             <TableHead className="w-[100px]">ID</TableHead>
             <TableHead>Email</TableHead>
             <TableHead>Role</TableHead>
+            <TableHead className="text-right">Actions</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           {users.length === 0 ? (
             <TableRow>
-              <TableCell colSpan={3} className="text-center">
+              <TableCell colSpan={4} className="text-center">
                 No users found.
               </TableCell>
             </TableRow>
@@ -102,6 +104,14 @@ export default function UsersPage() {
                   >
                     {user.role}
                   </span>
+                </TableCell>
+                <TableCell className="text-right">
+                  <Link
+                    href={`/dashboard/risk-audit?userId=${user.id}`}
+                    className="text-blue-600 hover:underline"
+                  >
+                    View Risk Audit
+                  </Link>
                 </TableCell>
               </TableRow>
             ))

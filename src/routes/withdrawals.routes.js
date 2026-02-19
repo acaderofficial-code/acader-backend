@@ -26,6 +26,10 @@ import {
   createRiskAuditLog,
   RISK_AUDIT_ACTION,
 } from "../services/fraud/risk_audit.js";
+import {
+  appendFinancialEventLog,
+  FINANCIAL_EVENT_TYPE,
+} from "../services/financial_event_log.service.js";
 
 const router = express.Router();
 const FRAUD_BLOCK_THRESHOLD = 60;
@@ -256,6 +260,22 @@ router.post(
           { client },
         );
 
+        await appendFinancialEventLog(
+          {
+            eventType: FINANCIAL_EVENT_TYPE.WITHDRAWAL_REQUESTED,
+            userId: user_id,
+            withdrawalId: reviewWithdrawal.id,
+            eventPayload: {
+              amount: normalizedAmount,
+              status: reviewWithdrawal.status,
+              bank_name,
+              account_number: account_number?.slice(-4),
+              pending_review: true,
+            },
+          },
+          { client },
+        );
+
         await notifyAdminsOfFraud(
           client,
           `User ${user_id} withdrawal blocked by behavioural risk model (review ${review?.id ?? "pending"})`,
@@ -337,6 +357,22 @@ router.post(
           { client },
         );
 
+        await appendFinancialEventLog(
+          {
+            eventType: FINANCIAL_EVENT_TYPE.WITHDRAWAL_REQUESTED,
+            userId: user_id,
+            withdrawalId: reviewWithdrawal.id,
+            eventPayload: {
+              amount: normalizedAmount,
+              status: reviewWithdrawal.status,
+              bank_name,
+              account_number: account_number?.slice(-4),
+              pending_review: true,
+            },
+          },
+          { client },
+        );
+
         await notifyAdminsOfFraud(
           client,
           `User ${user_id} withdrawal flagged by fraud engine (review ${review?.id ?? "pending"})`,
@@ -398,6 +434,21 @@ router.post(
       );
       createdWithdrawal = withReference.rows[0] ?? createdWithdrawal;
       await createWithdrawalHold(client, createdWithdrawal);
+      await appendFinancialEventLog(
+        {
+          eventType: FINANCIAL_EVENT_TYPE.WITHDRAWAL_REQUESTED,
+          userId: user_id,
+          withdrawalId: createdWithdrawal.id,
+          eventPayload: {
+            amount: normalizedAmount,
+            status: createdWithdrawal.status,
+            bank_name,
+            account_number: account_number?.slice(-4),
+            pending_review: false,
+          },
+        },
+        { client },
+      );
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK");
@@ -482,6 +533,39 @@ router.patch(
             );
 
       updated = updatedResult.rows[0];
+
+      if (targetStatus === "processing") {
+        await appendFinancialEventLog(
+          {
+            eventType: FINANCIAL_EVENT_TYPE.WITHDRAWAL_APPROVED,
+            userId: withdrawal.user_id,
+            withdrawalId: updated.id,
+            eventPayload: {
+              amount: withdrawal.amount,
+              previous_status: withdrawal.status,
+              new_status: "processing",
+            },
+          },
+          { client },
+        );
+      }
+
+      if (targetStatus === "rejected") {
+        await appendFinancialEventLog(
+          {
+            eventType: FINANCIAL_EVENT_TYPE.WITHDRAWAL_REJECTED,
+            userId: withdrawal.user_id,
+            withdrawalId: updated.id,
+            eventPayload: {
+              amount: withdrawal.amount,
+              previous_status: withdrawal.status,
+              new_status: "rejected",
+              reason: reason ?? null,
+            },
+          },
+          { client },
+        );
+      }
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK");

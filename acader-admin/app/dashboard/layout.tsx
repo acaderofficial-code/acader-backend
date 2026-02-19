@@ -82,6 +82,41 @@ export default function DashboardLayout({
           </Link>
 
           <Link
+            href="/dashboard/reconciliation"
+            className="rounded px-3 py-2 hover:bg-gray-800"
+          >
+            Reconciliation
+          </Link>
+
+          <Link
+            href="/dashboard/settlements"
+            className="rounded px-3 py-2 hover:bg-gray-800"
+          >
+            Settlements
+          </Link>
+
+          <Link
+            href="/dashboard/fraud-reviews"
+            className="rounded px-3 py-2 hover:bg-gray-800"
+          >
+            Fraud Reviews
+          </Link>
+
+          <Link
+            href="/dashboard/risk-audit"
+            className="rounded px-3 py-2 hover:bg-gray-800"
+          >
+            Risk Audit
+          </Link>
+
+          <Link
+            href="/dashboard/financial-verify"
+            className="rounded px-3 py-2 hover:bg-gray-800"
+          >
+            Financial Verify
+          </Link>
+
+          <Link
             href="/dashboard/webhooks"
             className="rounded px-3 py-2 hover:bg-gray-800"
           >

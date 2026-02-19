@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState, useCallback } from "react";
 import {
   Table,
@@ -19,7 +20,13 @@ type Withdrawal = {
   amount: number;
   bank_name: string;
   account_number: string;
-  status: "pending" | "processing" | "rejected" | "completed" | "failed";
+  status:
+    | "pending"
+    | "pending_review"
+    | "processing"
+    | "rejected"
+    | "completed"
+    | "failed";
   created_at: string;
   email: string;
 };
@@ -141,8 +148,10 @@ export default function WithdrawalsPage() {
                     className={`px-2 py-1 rounded text-xs font-medium ${
                       w.status === "completed"
                         ? "bg-green-100 text-green-800"
-                        : w.status === "rejected" || w.status === "failed"
+                      : w.status === "rejected" || w.status === "failed"
                           ? "bg-red-100 text-red-800"
+                          : w.status === "pending_review"
+                            ? "bg-purple-100 text-purple-800"
                           : w.status === "processing"
                             ? "bg-blue-100 text-blue-800"
                           : "bg-yellow-100 text-yellow-800"
@@ -176,6 +185,14 @@ export default function WithdrawalsPage() {
                           : "Reject"}
                       </button>
                     </div>
+                  )}
+                  {w.status === "pending_review" && (
+                    <Link
+                      href="/dashboard/fraud-reviews"
+                      className="text-sm text-purple-700 hover:underline"
+                    >
+                      In manual review
+                    </Link>
                   )}
                 </TableCell>
               </TableRow>

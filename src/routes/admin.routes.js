@@ -21,6 +21,11 @@ import {
   createRiskAuditLog,
   RISK_AUDIT_ACTION,
 } from "../services/fraud/risk_audit.js";
+import {
+  appendFinancialEventLog,
+  FINANCIAL_EVENT_TYPE,
+  verifyFinancialEventChain,
+} from "../services/financial_event_log.service.js";
 
 const router = express.Router();
 const UUID_REGEX =
@@ -35,17 +40,35 @@ router.use(verifyToken, requireAdmin);
 router.get(
   "/stats",
   asyncHandler(async (req, res) => {
-    const users = await pool.query("SELECT COUNT(*) FROM users");
-    const payments = await pool.query("SELECT COUNT(*) FROM payments");
-    const paymentVolume = await pool.query(
-      "SELECT SUM(amount) FROM payments WHERE status = 'paid' OR status = 'released'",
-    );
-    const disputes = await pool.query(
-      "SELECT COUNT(*) FROM disputes WHERE status IN ('open', 'under_review')",
-    );
-    const withdrawals = await pool.query(
-      "SELECT COUNT(*) FROM withdrawals WHERE status IN ('pending', 'pending_review')",
-    );
+    const [
+      users,
+      payments,
+      paymentVolume,
+      disputes,
+      withdrawals,
+      pendingFraudReviews,
+      restrictedWallets,
+      unresolvedReconciliationFlags,
+      latestSettlement,
+    ] = await Promise.all([
+      pool.query("SELECT COUNT(*) FROM users"),
+      pool.query("SELECT COUNT(*) FROM payments"),
+      pool.query(
+        "SELECT SUM(amount) FROM payments WHERE status = 'paid' OR status = 'released'",
+      ),
+      pool.query(
+        "SELECT COUNT(*) FROM disputes WHERE status IN ('open', 'under_review')",
+      ),
+      pool.query(
+        "SELECT COUNT(*) FROM withdrawals WHERE status IN ('pending', 'pending_review')",
+      ),
+      pool.query("SELECT COUNT(*) FROM fraud_reviews WHERE status = 'PENDING'"),
+      pool.query("SELECT COUNT(*) FROM wallet_restrictions"),
+      pool.query(
+        "SELECT COUNT(*) FROM reconciliation_flags WHERE resolved = false",
+      ),
+      pool.query("SELECT MAX(report_date) AS latest_settlement_date FROM settlement_reports"),
+    ]);
 
     res.json({
       totalUsers: parseInt(users.rows[0].count),
@@ -53,6 +76,13 @@ router.get(
       totalVolume: parseInt(paymentVolume.rows[0].sum || 0),
       openDisputes: parseInt(disputes.rows[0].count),
       pendingWithdrawals: parseInt(withdrawals.rows[0].count),
+      pendingFraudReviews: parseInt(pendingFraudReviews.rows[0].count),
+      restrictedWallets: parseInt(restrictedWallets.rows[0].count),
+      unresolvedReconciliationFlags: parseInt(
+        unresolvedReconciliationFlags.rows[0].count,
+      ),
+      latestSettlementDate:
+        latestSettlement.rows[0]?.latest_settlement_date ?? null,
     });
   }),
 );
@@ -125,6 +155,19 @@ router.get(
 router.get(
   "/fraud/reviews",
   asyncHandler(async (req, res) => {
+    const requestedStatus = String(req.query.status ?? "PENDING").toUpperCase();
+    const includeAll = requestedStatus === "ALL";
+    const allowedStatuses = Object.values(FRAUD_REVIEW_STATUS);
+
+    if (!includeAll && !allowedStatuses.includes(requestedStatus)) {
+      return res.status(400).json({
+        message: "Invalid status. Use PENDING|APPROVED|REJECTED|ALL",
+      });
+    }
+
+    const statusClause = includeAll ? "" : "WHERE fr.status = $1";
+    const values = includeAll ? [] : [requestedStatus];
+
     const result = await pool.query(
       `
       SELECT
@@ -139,18 +182,25 @@ router.get(
         fr.risk_score,
         fr.reason,
         fr.status,
+        fr.reviewed_by,
+        fr.reviewed_at,
+        fr.admin_note,
         fr.created_at
       FROM fraud_reviews fr
       JOIN users u ON u.id = fr.user_id
       LEFT JOIN payments p ON p.id = fr.payment_id
       LEFT JOIN withdrawals w ON w.id = fr.withdrawal_id
-      WHERE fr.status = $1
+      ${statusClause}
       ORDER BY fr.created_at ASC
       `,
-      [FRAUD_REVIEW_STATUS.PENDING],
+      values,
     );
 
-    res.json(result.rows);
+    res.json({
+      status: includeAll ? "ALL" : requestedStatus,
+      total: result.rows.length,
+      reviews: result.rows,
+    });
   }),
 );
 
@@ -249,6 +299,21 @@ router.post(
       );
 
       updatedReview = reviewUpdateResult.rows[0];
+      await appendFinancialEventLog(
+        {
+          eventType: FINANCIAL_EVENT_TYPE.WITHDRAWAL_APPROVED,
+          userId: review.user_id,
+          withdrawalId: review.withdrawal_id ?? null,
+          eventPayload: {
+            source: "manual_review",
+            review_id: review.id,
+            review_reason: review.reason,
+            risk_score: review.risk_score,
+            admin_note: adminNote || null,
+          },
+        },
+        { client },
+      );
       await createRiskAuditLog(
         {
           userId: review.user_id,
@@ -402,6 +467,36 @@ router.post(
       );
       updatedReview = reviewUpdateResult.rows[0];
 
+      await appendFinancialEventLog(
+        {
+          eventType: FINANCIAL_EVENT_TYPE.WITHDRAWAL_REJECTED,
+          userId: review.user_id,
+          withdrawalId: review.withdrawal_id ?? null,
+          eventPayload: {
+            source: "manual_review",
+            review_id: review.id,
+            review_reason: review.reason,
+            risk_score: review.risk_score,
+            admin_note: adminNote || null,
+          },
+        },
+        { client },
+      );
+      await appendFinancialEventLog(
+        {
+          eventType: FINANCIAL_EVENT_TYPE.WALLET_RESTRICTED,
+          userId: review.user_id,
+          withdrawalId: review.withdrawal_id ?? null,
+          paymentId: review.payment_id ?? null,
+          eventPayload: {
+            reason: restrictionReason || "FINANCIAL_RISK",
+            source: "manual_review",
+            review_id: review.id,
+          },
+        },
+        { client },
+      );
+
       await createRiskAuditLog(
         {
           userId: review.user_id,
@@ -511,6 +606,89 @@ router.get(
         total: totalResult.rows[0]?.total ?? 0,
       },
       logs: logsResult.rows,
+    });
+  }),
+);
+
+/**
+ * Verify immutable financial event hash chain
+ * GET /api/admin/audit/financial/verify
+ */
+router.get(
+  "/audit/financial/verify",
+  asyncHandler(async (_req, res) => {
+    const verification = await verifyFinancialEventChain();
+    res.json(verification);
+  }),
+);
+
+/**
+ * Financial event logs (admin only)
+ * GET /api/admin/audit/financial/events?limit=100&offset=0&event_type=...
+ */
+router.get(
+  "/audit/financial/events",
+  asyncHandler(async (req, res) => {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 500);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const eventType =
+      typeof req.query.event_type === "string" ? req.query.event_type.trim() : "";
+
+    const filters = [];
+    const values = [];
+    if (eventType) {
+      values.push(eventType);
+      filters.push(`fel.event_type = $${values.length}`);
+    }
+
+    const whereClause = filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const eventsQuery = `
+      SELECT
+        fel.id,
+        fel.event_type,
+        fel.user_id,
+        u.email AS user_email,
+        fel.payment_id,
+        p.provider_ref AS payment_reference,
+        fel.withdrawal_id,
+        w.amount AS withdrawal_amount,
+        fel.dispute_id,
+        fel.event_payload,
+        fel.previous_hash,
+        fel.current_hash,
+        fel.created_at
+      FROM financial_event_log fel
+      LEFT JOIN users u ON u.id = fel.user_id
+      LEFT JOIN payments p ON p.id = fel.payment_id
+      LEFT JOIN withdrawals w ON w.id = fel.withdrawal_id
+      ${whereClause}
+      ORDER BY fel.created_at DESC, fel.id DESC
+      LIMIT $${values.length + 1}
+      OFFSET $${values.length + 2}
+    `;
+
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM financial_event_log fel
+      ${whereClause}
+    `;
+
+    const [eventsResult, countResult] = await Promise.all([
+      pool.query(eventsQuery, [...values, limit, offset]),
+      pool.query(countQuery, values),
+    ]);
+
+    res.json({
+      filters: {
+        event_type: eventType || null,
+      },
+      pagination: {
+        limit,
+        offset,
+        total: countResult.rows[0]?.total ?? 0,
+      },
+      events: eventsResult.rows,
     });
   }),
 );
@@ -849,6 +1027,308 @@ router.get(
 );
 
 /**
+ * Reconciliation logs (admin only)
+ * GET /api/admin/reports/reconciliation/logs
+ * Query params:
+ * - status: ok|mismatch
+ * - wallet_id
+ * - limit (default 100, max 500)
+ * - offset (default 0)
+ */
+router.get(
+  "/reports/reconciliation/logs",
+  asyncHandler(async (req, res) => {
+    const {
+      status,
+      wallet_id,
+      limit = "100",
+      offset = "0",
+    } = req.query;
+
+    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+    const parsedOffset = Math.max(parseInt(offset, 10) || 0, 0);
+
+    const filters = [];
+    const values = [];
+
+    if (status !== undefined) {
+      if (!["ok", "mismatch"].includes(String(status))) {
+        return res.status(400).json({ message: "Invalid status. Use ok|mismatch" });
+      }
+      values.push(String(status));
+      filters.push(`rl.status = $${values.length}`);
+    }
+
+    let parsedWalletId;
+    if (wallet_id !== undefined) {
+      parsedWalletId = parseInt(wallet_id, 10);
+      if (Number.isNaN(parsedWalletId) || parsedWalletId <= 0) {
+        return res.status(400).json({ message: "Invalid wallet_id" });
+      }
+      values.push(parsedWalletId);
+      filters.push(`rl.wallet_id = $${values.length}`);
+    }
+
+    const whereClause = filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const logsQuery = `
+      SELECT
+        rl.*,
+        w.user_id,
+        u.email,
+        EXISTS (
+          SELECT 1
+          FROM reconciliation_flags rf
+          WHERE rf.wallet_id = rl.wallet_id
+            AND rf.resolved = false
+        ) AS has_unresolved_flag
+      FROM reconciliation_logs rl
+      JOIN wallets w ON w.id = rl.wallet_id
+      JOIN users u ON u.id = w.user_id
+      ${whereClause}
+      ORDER BY rl.created_at DESC, rl.id DESC
+      LIMIT $${values.length + 1}
+      OFFSET $${values.length + 2}
+    `;
+
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM reconciliation_logs rl
+      ${whereClause}
+    `;
+
+    const [logsResult, countResult] = await Promise.all([
+      pool.query(logsQuery, [...values, parsedLimit, parsedOffset]),
+      pool.query(countQuery, values),
+    ]);
+
+    res.json({
+      filters: {
+        status: status ?? null,
+        wallet_id: parsedWalletId ?? null,
+      },
+      pagination: {
+        limit: parsedLimit,
+        offset: parsedOffset,
+        total: countResult.rows[0]?.total ?? 0,
+      },
+      logs: logsResult.rows,
+    });
+  }),
+);
+
+/**
+ * Reconciliation flags (admin only)
+ * GET /api/admin/reports/reconciliation/flags
+ * Query params:
+ * - resolved: true|false|all (default false)
+ * - wallet_id
+ * - limit (default 100, max 500)
+ * - offset (default 0)
+ */
+router.get(
+  "/reports/reconciliation/flags",
+  asyncHandler(async (req, res) => {
+    const {
+      resolved = "false",
+      wallet_id,
+      limit = "100",
+      offset = "0",
+    } = req.query;
+
+    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+    const parsedOffset = Math.max(parseInt(offset, 10) || 0, 0);
+
+    const normalizedResolved = String(resolved).toLowerCase();
+    const filters = [];
+    const values = [];
+
+    if (normalizedResolved !== "all") {
+      if (normalizedResolved !== "true" && normalizedResolved !== "false") {
+        return res.status(400).json({
+          message: "Invalid resolved filter. Use true|false|all",
+        });
+      }
+      values.push(normalizedResolved === "true");
+      filters.push(`rf.resolved = $${values.length}`);
+    }
+
+    let parsedWalletId;
+    if (wallet_id !== undefined) {
+      parsedWalletId = parseInt(wallet_id, 10);
+      if (Number.isNaN(parsedWalletId) || parsedWalletId <= 0) {
+        return res.status(400).json({ message: "Invalid wallet_id" });
+      }
+      values.push(parsedWalletId);
+      filters.push(`rf.wallet_id = $${values.length}`);
+    }
+
+    const whereClause = filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const flagsQuery = `
+      SELECT
+        rf.*,
+        w.user_id,
+        u.email
+      FROM reconciliation_flags rf
+      JOIN wallets w ON w.id = rf.wallet_id
+      JOIN users u ON u.id = w.user_id
+      ${whereClause}
+      ORDER BY rf.created_at DESC, rf.id DESC
+      LIMIT $${values.length + 1}
+      OFFSET $${values.length + 2}
+    `;
+
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM reconciliation_flags rf
+      ${whereClause}
+    `;
+
+    const [flagsResult, countResult] = await Promise.all([
+      pool.query(flagsQuery, [...values, parsedLimit, parsedOffset]),
+      pool.query(countQuery, values),
+    ]);
+
+    res.json({
+      filters: {
+        resolved: normalizedResolved,
+        wallet_id: parsedWalletId ?? null,
+      },
+      pagination: {
+        limit: parsedLimit,
+        offset: parsedOffset,
+        total: countResult.rows[0]?.total ?? 0,
+      },
+      flags: flagsResult.rows,
+    });
+  }),
+);
+
+/**
+ * Resolve a reconciliation flag (admin only)
+ * PATCH /api/admin/reports/reconciliation/flags/:id/resolve
+ */
+router.patch(
+  "/reports/reconciliation/flags/:id/resolve",
+  asyncHandler(async (req, res) => {
+    const id = req.params.id;
+    if (!isUuid(id)) {
+      return res.status(400).json({ message: "Invalid flag id" });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE reconciliation_flags
+      SET resolved = true
+      WHERE id = $1
+      RETURNING *
+      `,
+      [id],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "Reconciliation flag not found" });
+    }
+
+    res.json({
+      message: "Reconciliation flag marked as resolved",
+      flag: result.rows[0],
+    });
+  }),
+);
+
+/**
+ * Settlement reports (admin only)
+ * GET /api/admin/reports/settlements
+ * Query params:
+ * - from (YYYY-MM-DD)
+ * - to (YYYY-MM-DD)
+ * - limit (default 100, max 500)
+ * - offset (default 0)
+ */
+router.get(
+  "/reports/settlements",
+  asyncHandler(async (req, res) => {
+    const { from, to, limit = "100", offset = "0" } = req.query;
+
+    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+    const parsedOffset = Math.max(parseInt(offset, 10) || 0, 0);
+
+    const filters = [];
+    const values = [];
+
+    let fromDate;
+    if (from !== undefined) {
+      fromDate = new Date(from);
+      if (Number.isNaN(fromDate.getTime())) {
+        return res.status(400).json({ message: "Invalid from date" });
+      }
+      values.push(fromDate.toISOString().slice(0, 10));
+      filters.push(`report_date >= $${values.length}::date`);
+    }
+
+    let toDate;
+    if (to !== undefined) {
+      toDate = new Date(to);
+      if (Number.isNaN(toDate.getTime())) {
+        return res.status(400).json({ message: "Invalid to date" });
+      }
+      values.push(toDate.toISOString().slice(0, 10));
+      filters.push(`report_date <= $${values.length}::date`);
+    }
+
+    const whereClause = filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const reportsQuery = `
+      SELECT *
+      FROM settlement_reports
+      ${whereClause}
+      ORDER BY report_date DESC
+      LIMIT $${values.length + 1}
+      OFFSET $${values.length + 2}
+    `;
+
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM settlement_reports
+      ${whereClause}
+    `;
+
+    const totalsQuery = `
+      SELECT
+        COALESCE(SUM(escrow_inflow), 0) AS escrow_inflow,
+        COALESCE(SUM(released_to_students), 0) AS released_to_students,
+        COALESCE(SUM(refunded_to_companies), 0) AS refunded_to_companies,
+        COALESCE(SUM(withdrawals), 0) AS withdrawals,
+        COALESCE(SUM(platform_fees), 0) AS platform_fees
+      FROM settlement_reports
+      ${whereClause}
+    `;
+
+    const [reportsResult, countResult, totalsResult] = await Promise.all([
+      pool.query(reportsQuery, [...values, parsedLimit, parsedOffset]),
+      pool.query(countQuery, values),
+      pool.query(totalsQuery, values),
+    ]);
+
+    res.json({
+      filters: {
+        from: fromDate ? fromDate.toISOString().slice(0, 10) : null,
+        to: toDate ? toDate.toISOString().slice(0, 10) : null,
+      },
+      pagination: {
+        limit: parsedLimit,
+        offset: parsedOffset,
+        total: countResult.rows[0]?.total ?? 0,
+      },
+      totals: totalsResult.rows[0],
+      reports: reportsResult.rows,
+    });
+  }),
+);
+
+/**
  * Admin dispute status update
  * PATCH /api/admin/disputes/:id/status
  * body: { status: "under_review" | "rejected" }
@@ -951,6 +1431,19 @@ router.patch(
           },
           { client },
         );
+        await appendFinancialEventLog(
+          {
+            eventType: FINANCIAL_EVENT_TYPE.DISPUTE_RESOLVED,
+            userId: dispute.payment_user_id,
+            paymentId: dispute.payment_id,
+            disputeId: dispute.id,
+            eventPayload: {
+              status: "rejected",
+              source: "admin_status_update",
+            },
+          },
+          { client },
+        );
 
         const studentUserId = Number(dispute.student_user_id);
         if (
@@ -965,6 +1458,19 @@ router.patch(
               reason: "DISPUTE_REJECTED",
               relatedPaymentId: dispute.payment_id,
               adminId,
+            },
+            { client },
+          );
+          await appendFinancialEventLog(
+            {
+              eventType: FINANCIAL_EVENT_TYPE.DISPUTE_RESOLVED,
+              userId: studentUserId,
+              paymentId: dispute.payment_id,
+              disputeId: dispute.id,
+              eventPayload: {
+                status: "rejected",
+                source: "admin_status_update",
+              },
             },
             { client },
           );
@@ -1135,6 +1641,17 @@ router.patch(
               relatedPaymentId: dispute.payment_id,
               adminId,
             });
+            await appendFinancialEventLog({
+              eventType: FINANCIAL_EVENT_TYPE.ESCROW_RELEASE_REJECTED,
+              userId: studentUserId,
+              paymentId: dispute.payment_id,
+              disputeId: dispute.id,
+              eventPayload: {
+                reason: "STUDENT_RESTRICTED",
+                source: "dispute_resolve",
+                restriction_reason: restriction.reason ?? null,
+              },
+            });
           } catch (auditErr) {
             console.error("[risk_audit] release rejection log failed", auditErr.message);
           }
@@ -1295,6 +1812,19 @@ router.patch(
         },
         { client },
       );
+      await appendFinancialEventLog(
+        {
+          eventType: FINANCIAL_EVENT_TYPE.DISPUTE_RESOLVED,
+          userId: dispute.payment_user_id,
+          paymentId: dispute.payment_id,
+          disputeId: dispute.id,
+          eventPayload: {
+            resolution: normalizedResolution,
+            source: "admin_resolve",
+          },
+        },
+        { client },
+      );
       if (
         Number.isInteger(studentUserId) &&
         studentUserId > 0 &&
@@ -1307,6 +1837,19 @@ router.patch(
             reason: normalizedResolution,
             relatedPaymentId: dispute.payment_id,
             adminId,
+          },
+          { client },
+        );
+        await appendFinancialEventLog(
+          {
+            eventType: FINANCIAL_EVENT_TYPE.DISPUTE_RESOLVED,
+            userId: studentUserId,
+            paymentId: dispute.payment_id,
+            disputeId: dispute.id,
+            eventPayload: {
+              resolution: normalizedResolution,
+              source: "admin_resolve",
+            },
           },
           { client },
         );

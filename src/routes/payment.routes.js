@@ -26,6 +26,10 @@ import {
   createRiskAuditLog,
   RISK_AUDIT_ACTION,
 } from "../services/fraud/risk_audit.js";
+import {
+  appendFinancialEventLog,
+  FINANCIAL_EVENT_TYPE,
+} from "../services/financial_event_log.service.js";
 
 const router = express.Router();
 
@@ -306,6 +310,15 @@ router.patch(
             relatedPaymentId: id,
             adminId,
           });
+          await appendFinancialEventLog({
+            eventType: FINANCIAL_EVENT_TYPE.ESCROW_RELEASE_REJECTED,
+            userId: studentUserId,
+            paymentId: id,
+            eventPayload: {
+              reason: "STUDENT_RESTRICTED",
+              source: "admin_payment_status",
+            },
+          });
         } catch (auditErr) {
           console.error("[risk_audit] release rejection log failed", auditErr.message);
         }
@@ -369,6 +382,15 @@ router.patch(
 
     if (status === "released") {
       const recipientUserId = studentUserId ?? updatedPayment.user_id;
+      await appendFinancialEventLog({
+        eventType: FINANCIAL_EVENT_TYPE.ESCROW_RELEASED,
+        userId: recipientUserId,
+        paymentId: id,
+        eventPayload: {
+          source: "admin_payment_status",
+          amount: updatedPayment.amount,
+        },
+      });
       await createRiskAuditLog({
         userId: recipientUserId,
         actionType: RISK_AUDIT_ACTION.ESCROW_RELEASE_APPROVED,
@@ -743,6 +765,19 @@ router.post(
         },
         { client },
       );
+      await appendFinancialEventLog(
+        {
+          eventType: FINANCIAL_EVENT_TYPE.DISPUTE_OPENED,
+          userId: pay.user_id,
+          paymentId: id,
+          disputeId: dispute.id,
+          eventPayload: {
+            reason: reason ?? "",
+            source: "payment_route",
+          },
+        },
+        { client },
+      );
       const parsedStudentUserId = Number(pay.student_user_id);
       if (
         Number.isInteger(parsedStudentUserId) &&
@@ -755,6 +790,19 @@ router.post(
             actionType: RISK_AUDIT_ACTION.DISPUTE_OPENED,
             reason: "PAYMENT_DISPUTE_OPENED",
             relatedPaymentId: id,
+          },
+          { client },
+        );
+        await appendFinancialEventLog(
+          {
+            eventType: FINANCIAL_EVENT_TYPE.DISPUTE_OPENED,
+            userId: parsedStudentUserId,
+            paymentId: id,
+            disputeId: dispute.id,
+            eventPayload: {
+              reason: reason ?? "",
+              source: "payment_route",
+            },
           },
           { client },
         );

@@ -10,6 +10,10 @@ type DashboardStats = {
   totalVolume: number;
   openDisputes: number;
   pendingWithdrawals: number;
+  pendingFraudReviews: number;
+  restrictedWallets: number;
+  unresolvedReconciliationFlags: number;
+  latestSettlementDate: string | null;
 };
 
 export default function Dashboard() {
@@ -83,6 +87,41 @@ export default function Dashboard() {
               stats.pendingWithdrawals > 0
                 ? "bg-yellow-50 border-yellow-200"
                 : ""
+            }
+          />
+          <StatCard
+            title="Pending Fraud Reviews"
+            value={stats.pendingFraudReviews}
+            className={
+              stats.pendingFraudReviews > 0
+                ? "bg-orange-50 border-orange-200"
+                : ""
+            }
+          />
+          <StatCard
+            title="Restricted Wallets"
+            value={stats.restrictedWallets}
+            className={
+              stats.restrictedWallets > 0
+                ? "bg-red-50 border-red-200"
+                : ""
+            }
+          />
+          <StatCard
+            title="Open Recon Flags"
+            value={stats.unresolvedReconciliationFlags}
+            className={
+              stats.unresolvedReconciliationFlags > 0
+                ? "bg-amber-50 border-amber-200"
+                : ""
+            }
+          />
+          <StatCard
+            title="Latest Settlement"
+            value={
+              stats.latestSettlementDate
+                ? new Date(stats.latestSettlementDate).toLocaleDateString()
+                : "No report yet"
             }
           />
         </div>

@@ -26,7 +26,7 @@ export default function PaymentsPage() {
     if (!isAuthenticated) return;
 
     try {
-      const res = await fetch(apiUrl("/api/payments"), {
+      const res = await fetch(apiUrl("/api/admin/payments"), {
         headers: authHeaders(),
       });
 
