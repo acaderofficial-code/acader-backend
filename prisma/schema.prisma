@@ -33,3 +33,44 @@ model LedgerEntry {
 
   @@map("ledger_entries")
 }
+
+model Wallet {
+  id               Int      @id @default(autoincrement())
+  userId           Int      @unique @map("user_id")
+  balance          Decimal  @default(0) @db.Decimal(12, 2)
+  availableBalance Decimal  @default(0) @map("available_balance") @db.Decimal(12, 2)
+  escrowBalance    Decimal  @default(0) @map("escrow_balance") @db.Decimal(12, 2)
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  reconciliationLogs  ReconciliationLog[]
+  reconciliationFlags ReconciliationFlag[]
+
+  @@map("wallets")
+}
+
+model ReconciliationLog {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  walletId          Int      @map("wallet_id")
+  availableExpected Decimal  @map("available_expected") @db.Decimal(12, 2)
+  availableActual   Decimal  @map("available_actual") @db.Decimal(12, 2)
+  escrowExpected    Decimal  @map("escrow_expected") @db.Decimal(12, 2)
+  escrowActual      Decimal  @map("escrow_actual") @db.Decimal(12, 2)
+  status            String
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  wallet Wallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  @@map("reconciliation_logs")
+}
+
+model ReconciliationFlag {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  walletId  Int      @map("wallet_id")
+  reason    String
+  resolved  Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  wallet Wallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  @@map("reconciliation_flags")
+}

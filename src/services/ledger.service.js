@@ -179,8 +179,8 @@ export const syncWalletAvailableBalances = async (client, userIds) => {
 
   await client.query(
     `
-    INSERT INTO wallets (user_id, balance)
-    SELECT x.user_id, 0
+    INSERT INTO wallets (user_id, balance, available_balance, escrow_balance)
+    SELECT x.user_id, 0, 0, 0
     FROM unnest($1::int[]) AS x(user_id)
     ON CONFLICT (user_id) DO NOTHING
     `,
@@ -190,20 +190,28 @@ export const syncWalletAvailableBalances = async (client, userIds) => {
   await client.query(
     `
     UPDATE wallets w
-    SET balance = COALESCE(calc.available_balance, 0)
+    SET balance = COALESCE(calc.available_balance, 0),
+        available_balance = COALESCE(calc.available_balance, 0),
+        escrow_balance = COALESCE(calc.escrow_balance, 0)
     FROM (
       SELECT x.user_id,
              COALESCE(SUM(
                CASE
-                 WHEN le.direction = 'credit' THEN le.amount
-                 WHEN le.direction = 'debit' THEN -le.amount
+                 WHEN le.balance_type = 'available' AND le.direction = 'credit' THEN le.amount
+                 WHEN le.balance_type = 'available' AND le.direction = 'debit' THEN -le.amount
                  ELSE 0
                END
-             ), 0) AS available_balance
+             ), 0) AS available_balance,
+             COALESCE(SUM(
+               CASE
+                 WHEN le.balance_type = 'escrow' AND le.direction = 'credit' THEN le.amount
+                 WHEN le.balance_type = 'escrow' AND le.direction = 'debit' THEN -le.amount
+                 ELSE 0
+               END
+             ), 0) AS escrow_balance
       FROM unnest($1::int[]) AS x(user_id)
       LEFT JOIN ledger_entries le
         ON le.user_id = x.user_id
-       AND le.balance_type = 'available'
       GROUP BY x.user_id
     ) calc
     WHERE w.user_id = calc.user_id
@@ -599,6 +607,7 @@ export const applyPaymentTransitionLedger = async (
         creditUserId: companyUserId,
         creditBalanceType: BALANCE_TYPE.ESCROW,
       });
+      walletUserIds.push(companyUserId);
       break;
     case "paid->released":
       ensureStudentRecipient(true);
@@ -631,6 +640,7 @@ export const applyPaymentTransitionLedger = async (
         creditUserId: companyUserId,
         creditBalanceType: BALANCE_TYPE.LOCKED,
       });
+      walletUserIds.push(companyUserId);
       break;
     case "disputed->released":
       ensureStudentRecipient(true);
