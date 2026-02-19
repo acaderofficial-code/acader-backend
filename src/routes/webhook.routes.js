@@ -7,6 +7,12 @@ import {
   settleWithdrawal,
 } from "../services/ledger.service.js";
 import { refreshRiskProfilesForUsers } from "../services/fraud/risk_profile.js";
+import {
+  enqueueFraudReview,
+  FRAUD_REVIEW_REASON,
+  getUserRiskScore,
+  getWalletRestriction,
+} from "../services/fraud/review_queue.js";
 
 const router = express.Router();
 
@@ -366,6 +372,17 @@ router.post("/paystack", async (req, res) => {
           );
           return res.sendStatus(200);
         }
+
+        const restriction = await getWalletRestriction(studentUserId, { client });
+        if (restriction) {
+          await client.query("ROLLBACK");
+          console.error(`[${requestId}] transfer.success blocked: student restricted`, {
+            paymentId: payment.id,
+            studentUserId,
+            restrictionReason: restriction.reason,
+          });
+          return res.sendStatus(200);
+        }
       }
 
       let disputeId = null;
@@ -413,6 +430,17 @@ router.post("/paystack", async (req, res) => {
           RETURNING id, user_id, status, escrow, disputed
           `,
           [payment.id],
+        );
+
+        const riskScore = await getUserRiskScore(payment.user_id, { client });
+        await enqueueFraudReview(
+          {
+            userId: payment.user_id,
+            paymentId: payment.id,
+            riskScore,
+            reason: FRAUD_REVIEW_REASON.DISPUTE_OPENED,
+          },
+          { client },
         );
 
         updatedPayment = {

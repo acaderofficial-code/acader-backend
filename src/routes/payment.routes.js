@@ -16,6 +16,12 @@ import {
   syncWalletAvailableBalances,
 } from "../services/ledger.service.js";
 import { refreshRiskProfilesForUsers } from "../services/fraud/risk_profile.js";
+import {
+  enqueueFraudReview,
+  FRAUD_REVIEW_REASON,
+  getUserRiskScore,
+  getWalletRestriction,
+} from "../services/fraud/review_queue.js";
 
 const router = express.Router();
 
@@ -285,6 +291,12 @@ router.patch(
       }
 
       studentUserId = parsedStudentUserId;
+      const restriction = await getWalletRestriction(studentUserId);
+      if (restriction) {
+        return res.status(409).json({
+          message: "Student account restricted due to financial risk.",
+        });
+      }
     }
 
     if (status === "paid") escrow = true;
@@ -685,6 +697,17 @@ router.post(
       dispute = created.rows[0];
 
       await client.query("UPDATE payments SET disputed = true WHERE id = $1", [id]);
+
+      const riskScore = await getUserRiskScore(pay.user_id, { client });
+      await enqueueFraudReview(
+        {
+          userId: pay.user_id,
+          paymentId: id,
+          riskScore,
+          reason: FRAUD_REVIEW_REASON.DISPUTE_OPENED,
+        },
+        { client },
+      );
 
       await client.query(
         `INSERT INTO notifications (user_id, type, message, related_id)

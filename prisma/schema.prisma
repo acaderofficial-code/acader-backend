@@ -114,3 +114,27 @@ model UserRiskProfile {
 
   @@map("user_risk_profiles")
 }
+
+model FraudReview {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       Int       @map("user_id")
+  paymentId    Int?      @map("payment_id")
+  withdrawalId Int?      @map("withdrawal_id")
+  riskScore    Int       @default(0) @map("risk_score")
+  reason       String
+  status       String    @default("PENDING")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  reviewedBy   Int?      @map("reviewed_by")
+  reviewedAt   DateTime? @map("reviewed_at")
+  adminNote    String?   @map("admin_note")
+
+  @@map("fraud_reviews")
+}
+
+model WalletRestriction {
+  userId    Int      @id @map("user_id")
+  reason    String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("wallet_restrictions")
+}

@@ -8,10 +8,20 @@ import {
   applyPaymentPartialRefundLedger,
   applyPaymentRefundLedger,
   applyPaymentTransitionLedger,
+  createWithdrawalHold,
+  releaseWithdrawalHold,
   syncWalletAvailableBalances,
 } from "../services/ledger.service.js";
+import {
+  FRAUD_REVIEW_STATUS,
+  getWalletRestriction,
+  restrictWallet,
+} from "../services/fraud/review_queue.js";
 
 const router = express.Router();
+const UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const isUuid = (value) => UUID_REGEX.test(String(value ?? ""));
 
 router.use(verifyToken, requireAdmin);
 
@@ -30,7 +40,7 @@ router.get(
       "SELECT COUNT(*) FROM disputes WHERE status IN ('open', 'under_review')",
     );
     const withdrawals = await pool.query(
-      "SELECT COUNT(*) FROM withdrawals WHERE status = 'pending'",
+      "SELECT COUNT(*) FROM withdrawals WHERE status IN ('pending', 'pending_review')",
     );
 
     res.json({
@@ -101,6 +111,308 @@ router.get(
      ORDER BY w.created_at DESC`,
     );
     res.json(result.rows);
+  }),
+);
+
+/**
+ * Fraud manual review queue (admin only)
+ * GET /api/admin/fraud/reviews
+ */
+router.get(
+  "/fraud/reviews",
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `
+      SELECT
+        fr.id,
+        fr.user_id,
+        u.email AS user_email,
+        fr.payment_id,
+        p.provider_ref AS payment_reference,
+        fr.withdrawal_id,
+        w.amount AS withdrawal_amount,
+        w.status AS withdrawal_status,
+        fr.risk_score,
+        fr.reason,
+        fr.status,
+        fr.created_at
+      FROM fraud_reviews fr
+      JOIN users u ON u.id = fr.user_id
+      LEFT JOIN payments p ON p.id = fr.payment_id
+      LEFT JOIN withdrawals w ON w.id = fr.withdrawal_id
+      WHERE fr.status = $1
+      ORDER BY fr.created_at ASC
+      `,
+      [FRAUD_REVIEW_STATUS.PENDING],
+    );
+
+    res.json(result.rows);
+  }),
+);
+
+/**
+ * Approve fraud review (admin only)
+ * POST /api/admin/fraud/reviews/:id/approve
+ */
+router.post(
+  "/fraud/reviews/:id/approve",
+  asyncHandler(async (req, res) => {
+    const id = req.params.id;
+    const adminId = Number(req.user.id);
+    const adminNote =
+      typeof req.body?.admin_note === "string" ? req.body.admin_note.trim() : "";
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ message: "Invalid review id" });
+    }
+
+    const client = await pool.connect();
+    let updatedReview = null;
+    let updatedWithdrawal = null;
+    let targetUserId = null;
+    try {
+      await client.query("BEGIN");
+
+      const reviewResult = await client.query(
+        `
+        SELECT *
+        FROM fraud_reviews
+        WHERE id = $1
+        FOR UPDATE
+        `,
+        [id],
+      );
+
+      if (reviewResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "Fraud review not found" });
+      }
+
+      const review = reviewResult.rows[0];
+      targetUserId = review.user_id;
+      if (review.status !== FRAUD_REVIEW_STATUS.PENDING) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Fraud review already resolved" });
+      }
+
+      if (review.withdrawal_id) {
+        const withdrawalResult = await client.query(
+          `
+          SELECT *
+          FROM withdrawals
+          WHERE id = $1
+          FOR UPDATE
+          `,
+          [review.withdrawal_id],
+        );
+
+        if (withdrawalResult.rows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ message: "Withdrawal not found for review" });
+        }
+
+        const withdrawal = withdrawalResult.rows[0];
+        if (withdrawal.status === "pending_review") {
+          await createWithdrawalHold(client, withdrawal);
+          const withdrawalUpdateResult = await client.query(
+            `
+            UPDATE withdrawals
+            SET status = 'pending',
+                processed_at = NULL,
+                failure_reason = NULL
+            WHERE id = $1
+            RETURNING *
+            `,
+            [withdrawal.id],
+          );
+          updatedWithdrawal = withdrawalUpdateResult.rows[0] ?? withdrawal;
+        } else {
+          updatedWithdrawal = withdrawal;
+        }
+      }
+
+      const reviewUpdateResult = await client.query(
+        `
+        UPDATE fraud_reviews
+        SET status = 'APPROVED',
+            reviewed_by = $2,
+            reviewed_at = NOW(),
+            admin_note = COALESCE(NULLIF($3, ''), admin_note)
+        WHERE id = $1
+        RETURNING *
+        `,
+        [id, adminId, adminNote],
+      );
+
+      updatedReview = reviewUpdateResult.rows[0];
+      await client.query("COMMIT");
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // ignore rollback failure
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    if (Number.isInteger(targetUserId) && targetUserId > 0) {
+      await safeNotify(
+        targetUserId,
+        "fraud_review_approved",
+        "Your account activity review was approved.",
+        id,
+      );
+      if (updatedWithdrawal?.id) {
+        await safeNotify(
+          targetUserId,
+          "withdrawal_review_approved",
+          "Your withdrawal passed manual review and is ready for processing.",
+          updatedWithdrawal.id,
+        );
+      }
+    }
+
+    res.json({
+      message: "Fraud review approved",
+      review: updatedReview,
+      withdrawal: updatedWithdrawal,
+    });
+  }),
+);
+
+/**
+ * Reject fraud review (admin only)
+ * POST /api/admin/fraud/reviews/:id/reject
+ */
+router.post(
+  "/fraud/reviews/:id/reject",
+  asyncHandler(async (req, res) => {
+    const id = req.params.id;
+    const adminId = Number(req.user.id);
+    const adminNote =
+      typeof req.body?.admin_note === "string" ? req.body.admin_note.trim() : "";
+
+    if (!isUuid(id)) {
+      return res.status(400).json({ message: "Invalid review id" });
+    }
+
+    const client = await pool.connect();
+    let updatedReview = null;
+    let updatedWithdrawal = null;
+    let restriction = null;
+    let targetUserId = null;
+    try {
+      await client.query("BEGIN");
+
+      const reviewResult = await client.query(
+        `
+        SELECT *
+        FROM fraud_reviews
+        WHERE id = $1
+        FOR UPDATE
+        `,
+        [id],
+      );
+
+      if (reviewResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "Fraud review not found" });
+      }
+
+      const review = reviewResult.rows[0];
+      targetUserId = review.user_id;
+      if (review.status !== FRAUD_REVIEW_STATUS.PENDING) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Fraud review already resolved" });
+      }
+
+      if (review.withdrawal_id) {
+        const withdrawalResult = await client.query(
+          `
+          SELECT *
+          FROM withdrawals
+          WHERE id = $1
+          FOR UPDATE
+          `,
+          [review.withdrawal_id],
+        );
+
+        if (withdrawalResult.rows.length > 0) {
+          const withdrawal = withdrawalResult.rows[0];
+
+          if (withdrawal.status === "pending") {
+            await releaseWithdrawalHold(client, withdrawal, {
+              reversalType: "withdrawal_reversal",
+              idempotencySuffix: "review_reverse",
+            });
+          }
+
+          if (["pending_review", "pending"].includes(withdrawal.status)) {
+            const withdrawalUpdateResult = await client.query(
+              `
+              UPDATE withdrawals
+              SET status = 'rejected',
+                  processed_at = NOW(),
+                  failure_reason = COALESCE(NULLIF($2, ''), failure_reason, 'Rejected during fraud review')
+              WHERE id = $1
+              RETURNING *
+              `,
+              [withdrawal.id, adminNote],
+            );
+            updatedWithdrawal = withdrawalUpdateResult.rows[0] ?? withdrawal;
+          } else {
+            updatedWithdrawal = withdrawal;
+          }
+        }
+      }
+
+      const restrictionReason =
+        adminNote || `Manual fraud review rejected (${review.reason})`;
+      restriction = await restrictWallet(review.user_id, restrictionReason, { client });
+
+      const reviewUpdateResult = await client.query(
+        `
+        UPDATE fraud_reviews
+        SET status = 'REJECTED',
+            reviewed_by = $2,
+            reviewed_at = NOW(),
+            admin_note = COALESCE(NULLIF($3, ''), admin_note)
+        WHERE id = $1
+        RETURNING *
+        `,
+        [id, adminId, adminNote],
+      );
+      updatedReview = reviewUpdateResult.rows[0];
+
+      await client.query("COMMIT");
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // ignore rollback failure
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    if (Number.isInteger(targetUserId) && targetUserId > 0) {
+      await safeNotify(
+        targetUserId,
+        "fraud_review_rejected",
+        "Your account was restricted due to financial risk. Contact support for review.",
+        id,
+      );
+    }
+
+    res.json({
+      message: "Fraud review rejected and account restricted",
+      review: updatedReview,
+      restriction,
+      withdrawal: updatedWithdrawal,
+    });
   }),
 );
 
@@ -677,6 +989,19 @@ router.patch(
       };
 
       if (normalizedResolution === "release_to_student") {
+        if (!Number.isInteger(studentUserId) || studentUserId <= 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ message: "Invalid student mapping" });
+        }
+
+        const restriction = await getWalletRestriction(studentUserId, { client });
+        if (restriction) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            message: "Student account restricted due to financial risk.",
+          });
+        }
+
         if (
           dispute.payment_status === "paid" ||
           dispute.payment_status === "disputed"

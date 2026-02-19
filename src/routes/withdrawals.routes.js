@@ -15,6 +15,13 @@ import {
   updateUserRiskProfile,
 } from "../services/fraud/risk_profile.js";
 import { BEHAVIOURAL_RISK_THRESHOLD } from "../services/fraud/risk_score.js";
+import {
+  enqueueFraudReview,
+  FRAUD_REVIEW_REASON,
+  getPendingFraudReviewForUser,
+  getUserRiskScore,
+  getWalletRestriction,
+} from "../services/fraud/review_queue.js";
 
 const router = express.Router();
 const FRAUD_BLOCK_THRESHOLD = 60;
@@ -33,6 +40,34 @@ const notifyAdminsOfFraud = async (client, message) => {
       [admin.id, "Suspicious Withdrawal Attempt", message, "fraud_alert"],
     );
   }
+};
+
+const createPendingReviewWithdrawal = async (
+  client,
+  { userId, amount, bankName, accountNumber },
+) => {
+  const inserted = await client.query(
+    `
+    INSERT INTO withdrawals (user_id, amount, status, bank_name, account_number)
+    VALUES ($1, $2, 'pending_review', $3, $4)
+    RETURNING *
+    `,
+    [userId, amount, bankName, accountNumber],
+  );
+
+  const withdrawal = inserted.rows[0];
+  const providerRef = `withdrawal_${withdrawal.id}`;
+  const withRef = await client.query(
+    `
+    UPDATE withdrawals
+    SET provider_ref = COALESCE(provider_ref, $1)
+    WHERE id = $2
+    RETURNING *
+    `,
+    [providerRef, withdrawal.id],
+  );
+
+  return withRef.rows[0] ?? withdrawal;
 };
 
 /**
@@ -68,6 +103,23 @@ router.post(
         return res.status(404).json({ message: "User not found" });
       }
 
+      const restriction = await getWalletRestriction(user_id, { client });
+      if (restriction) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          message: "Account restricted due to financial risk.",
+        });
+      }
+
+      const pendingReview = await getPendingFraudReviewForUser(user_id, { client });
+      if (pendingReview) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          message: "Withdrawal pending admin review.",
+          review_id: pendingReview.id,
+        });
+      }
+
       const disputedPayment = await client.query(
         `
         SELECT p.id
@@ -84,9 +136,27 @@ router.post(
       );
 
       if (disputedPayment.rows.length > 0) {
-        await client.query("ROLLBACK");
+        const blockedPaymentId = Number(disputedPayment.rows[0].id);
+        const riskScore = await getUserRiskScore(user_id, { client });
+        const review = await enqueueFraudReview(
+          {
+            userId: user_id,
+            paymentId: blockedPaymentId,
+            riskScore,
+            reason: FRAUD_REVIEW_REASON.RULE_ENGINE_FLAG,
+          },
+          { client },
+        );
+
+        await notifyAdminsOfFraud(
+          client,
+          `User ${user_id} withdrawal blocked due to active dispute (review ${review?.id ?? "pending"})`,
+        );
+
+        await client.query("COMMIT");
         return res.status(409).json({
           message: "Withdrawal blocked: you have a payment under dispute",
+          review_id: review?.id ?? null,
         });
       }
 
@@ -123,9 +193,26 @@ router.post(
           { client },
         );
 
+        const reviewWithdrawal = await createPendingReviewWithdrawal(client, {
+          userId: user_id,
+          amount: normalizedAmount,
+          bankName: bank_name,
+          accountNumber: account_number,
+        });
+
+        const review = await enqueueFraudReview(
+          {
+            userId: user_id,
+            withdrawalId: reviewWithdrawal.id,
+            riskScore: behaviouralScore,
+            reason: FRAUD_REVIEW_REASON.AI_RISK_THRESHOLD_EXCEEDED,
+          },
+          { client },
+        );
+
         await notifyAdminsOfFraud(
           client,
-          `User ${user_id} withdrawal blocked by behavioural risk model`,
+          `User ${user_id} withdrawal blocked by behavioural risk model (review ${review?.id ?? "pending"})`,
         );
 
         console.error(`🚨 Fraud Risk Triggered for userId ${user_id}`);
@@ -136,6 +223,8 @@ router.post(
         await client.query("COMMIT");
         return res.status(403).json({
           message: "Withdrawal blocked due to high behavioural risk.",
+          review_id: review?.id ?? null,
+          withdrawal_id: reviewWithdrawal.id,
           risk: {
             riskScore: behaviouralScore,
             triggeredRules: ["AI_RISK_THRESHOLD_EXCEEDED"],
@@ -164,9 +253,26 @@ router.post(
           [user_id, rulesText, risk.riskScore, JSON.stringify(metadata)],
         );
 
+        const reviewWithdrawal = await createPendingReviewWithdrawal(client, {
+          userId: user_id,
+          amount: normalizedAmount,
+          bankName: bank_name,
+          accountNumber: account_number,
+        });
+
+        const review = await enqueueFraudReview(
+          {
+            userId: user_id,
+            withdrawalId: reviewWithdrawal.id,
+            riskScore: risk.riskScore,
+            reason: FRAUD_REVIEW_REASON.RULE_ENGINE_FLAG,
+          },
+          { client },
+        );
+
         await notifyAdminsOfFraud(
           client,
-          `User ${user_id} withdrawal flagged by fraud engine`,
+          `User ${user_id} withdrawal flagged by fraud engine (review ${review?.id ?? "pending"})`,
         );
 
         console.error(`🚨 Fraud Risk Triggered for userId ${user_id}`);
@@ -177,6 +283,8 @@ router.post(
         await client.query("COMMIT");
         return res.status(403).json({
           message: "Withdrawal under review due to risk detection.",
+          review_id: review?.id ?? null,
+          withdrawal_id: reviewWithdrawal.id,
           risk: {
             riskScore: risk.riskScore,
             triggeredRules: risk.triggeredRules,
