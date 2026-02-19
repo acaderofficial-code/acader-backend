@@ -13,6 +13,10 @@ import {
   getUserRiskScore,
   getWalletRestriction,
 } from "../services/fraud/review_queue.js";
+import {
+  createRiskAuditLog,
+  RISK_AUDIT_ACTION,
+} from "../services/fraud/risk_audit.js";
 
 const router = express.Router();
 
@@ -376,6 +380,16 @@ router.post("/paystack", async (req, res) => {
         const restriction = await getWalletRestriction(studentUserId, { client });
         if (restriction) {
           await client.query("ROLLBACK");
+          try {
+            await createRiskAuditLog({
+              userId: studentUserId,
+              actionType: RISK_AUDIT_ACTION.ESCROW_RELEASE_REJECTED,
+              reason: "STUDENT_RESTRICTED",
+              relatedPaymentId: payment.id,
+            });
+          } catch (auditErr) {
+            console.error("[risk_audit] webhook release rejection log failed", auditErr.message);
+          }
           console.error(`[${requestId}] transfer.success blocked: student restricted`, {
             paymentId: payment.id,
             studentUserId,
@@ -442,6 +456,32 @@ router.post("/paystack", async (req, res) => {
           },
           { client },
         );
+        await createRiskAuditLog(
+          {
+            userId: payment.user_id,
+            actionType: RISK_AUDIT_ACTION.DISPUTE_OPENED,
+            reason: "PAYSTACK_DISPUTE_WEBHOOK",
+            riskScore,
+            relatedPaymentId: payment.id,
+          },
+          { client },
+        );
+        const disputeStudentUserId = Number(payment.student_user_id);
+        if (
+          Number.isInteger(disputeStudentUserId) &&
+          disputeStudentUserId > 0 &&
+          disputeStudentUserId !== payment.user_id
+        ) {
+          await createRiskAuditLog(
+            {
+              userId: disputeStudentUserId,
+              actionType: RISK_AUDIT_ACTION.DISPUTE_OPENED,
+              reason: "PAYSTACK_DISPUTE_WEBHOOK",
+              relatedPaymentId: payment.id,
+            },
+            { client },
+          );
+        }
 
         updatedPayment = {
           ...(paymentDisputeUpdate.rows[0] ?? {}),
@@ -554,6 +594,17 @@ router.post("/paystack", async (req, res) => {
         dispute_id: disputeId,
         notification_user_id: notificationUserId,
       };
+      if (eventName === "transfer.success") {
+        await createRiskAuditLog(
+          {
+            userId: notificationUserId,
+            actionType: RISK_AUDIT_ACTION.ESCROW_RELEASE_APPROVED,
+            reason: "PAYSTACK_TRANSFER_SUCCESS",
+            relatedPaymentId: payment.id,
+          },
+          { client },
+        );
+      }
 
       await client.query("COMMIT");
       console.log(`[${requestId}] tx committed`, {

@@ -17,6 +17,10 @@ import {
   getWalletRestriction,
   restrictWallet,
 } from "../services/fraud/review_queue.js";
+import {
+  createRiskAuditLog,
+  RISK_AUDIT_ACTION,
+} from "../services/fraud/risk_audit.js";
 
 const router = express.Router();
 const UUID_REGEX =
@@ -245,6 +249,18 @@ router.post(
       );
 
       updatedReview = reviewUpdateResult.rows[0];
+      await createRiskAuditLog(
+        {
+          userId: review.user_id,
+          actionType: RISK_AUDIT_ACTION.ADMIN_APPROVED,
+          reason: adminNote || "MANUAL_REVIEW_APPROVED",
+          riskScore: review.risk_score ?? null,
+          relatedPaymentId: review.payment_id ?? null,
+          relatedWithdrawalId: review.withdrawal_id ?? null,
+          adminId,
+        },
+        { client },
+      );
       await client.query("COMMIT");
     } catch (err) {
       try {
@@ -386,6 +402,31 @@ router.post(
       );
       updatedReview = reviewUpdateResult.rows[0];
 
+      await createRiskAuditLog(
+        {
+          userId: review.user_id,
+          actionType: RISK_AUDIT_ACTION.ADMIN_REJECTED,
+          reason: adminNote || "MANUAL_REVIEW_REJECTED",
+          riskScore: review.risk_score ?? null,
+          relatedPaymentId: review.payment_id ?? null,
+          relatedWithdrawalId: review.withdrawal_id ?? null,
+          adminId,
+        },
+        { client },
+      );
+      await createRiskAuditLog(
+        {
+          userId: review.user_id,
+          actionType: RISK_AUDIT_ACTION.WALLET_RESTRICTED,
+          reason: restrictionReason || "FINANCIAL_RISK",
+          riskScore: review.risk_score ?? null,
+          relatedPaymentId: review.payment_id ?? null,
+          relatedWithdrawalId: review.withdrawal_id ?? null,
+          adminId,
+        },
+        { client },
+      );
+
       await client.query("COMMIT");
     } catch (err) {
       try {
@@ -412,6 +453,64 @@ router.post(
       review: updatedReview,
       restriction,
       withdrawal: updatedWithdrawal,
+    });
+  }),
+);
+
+/**
+ * Risk audit logs for a user (admin only)
+ * GET /api/admin/audit/risk/:userId?limit=100&offset=0
+ */
+router.get(
+  "/audit/risk/:userId",
+  asyncHandler(async (req, res) => {
+    const userId = Number(req.params.userId);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 500);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(400).json({ message: "Invalid user id" });
+    }
+
+    const [logsResult, totalResult] = await Promise.all([
+      pool.query(
+        `
+        SELECT
+          ral.*,
+          u.email AS user_email,
+          admin_user.email AS admin_email,
+          p.provider_ref AS payment_reference,
+          w.amount AS withdrawal_amount,
+          w.status AS withdrawal_status
+        FROM risk_audit_logs ral
+        JOIN users u ON u.id = ral.user_id
+        LEFT JOIN users admin_user ON admin_user.id = ral.admin_id
+        LEFT JOIN payments p ON p.id = ral.related_payment_id
+        LEFT JOIN withdrawals w ON w.id = ral.related_withdrawal_id
+        WHERE ral.user_id = $1
+        ORDER BY ral.created_at DESC
+        LIMIT $2 OFFSET $3
+        `,
+        [userId, limit, offset],
+      ),
+      pool.query(
+        `
+        SELECT COUNT(*)::int AS total
+        FROM risk_audit_logs
+        WHERE user_id = $1
+        `,
+        [userId],
+      ),
+    ]);
+
+    res.json({
+      user_id: userId,
+      pagination: {
+        limit,
+        offset,
+        total: totalResult.rows[0]?.total ?? 0,
+      },
+      logs: logsResult.rows,
     });
   }),
 );
@@ -759,6 +858,7 @@ router.patch(
   asyncHandler(async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { status } = req.body ?? {};
+    const adminId = Number(req.user.id);
 
     if (Number.isNaN(id)) {
       return res.status(400).json({ message: "Invalid dispute id" });
@@ -840,6 +940,35 @@ router.patch(
           `,
           [dispute.payment_id],
         );
+
+        await createRiskAuditLog(
+          {
+            userId: dispute.payment_user_id,
+            actionType: RISK_AUDIT_ACTION.DISPUTE_RESOLVED,
+            reason: "DISPUTE_REJECTED",
+            relatedPaymentId: dispute.payment_id,
+            adminId,
+          },
+          { client },
+        );
+
+        const studentUserId = Number(dispute.student_user_id);
+        if (
+          Number.isInteger(studentUserId) &&
+          studentUserId > 0 &&
+          studentUserId !== dispute.payment_user_id
+        ) {
+          await createRiskAuditLog(
+            {
+              userId: studentUserId,
+              actionType: RISK_AUDIT_ACTION.DISPUTE_RESOLVED,
+              reason: "DISPUTE_REJECTED",
+              relatedPaymentId: dispute.payment_id,
+              adminId,
+            },
+            { client },
+          );
+        }
       }
 
       await client.query("COMMIT");
@@ -892,6 +1021,7 @@ router.patch(
   asyncHandler(async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { resolution, partial_amount } = req.body ?? {};
+    const adminId = Number(req.user.id);
     const normalizedResolution =
       resolution === "release"
         ? "release_to_student"
@@ -997,6 +1127,17 @@ router.patch(
         const restriction = await getWalletRestriction(studentUserId, { client });
         if (restriction) {
           await client.query("ROLLBACK");
+          try {
+            await createRiskAuditLog({
+              userId: studentUserId,
+              actionType: RISK_AUDIT_ACTION.ESCROW_RELEASE_REJECTED,
+              reason: "STUDENT_RESTRICTED",
+              relatedPaymentId: dispute.payment_id,
+              adminId,
+            });
+          } catch (auditErr) {
+            console.error("[risk_audit] release rejection log failed", auditErr.message);
+          }
           return res.status(409).json({
             message: "Student account restricted due to financial risk.",
           });
@@ -1032,6 +1173,17 @@ router.patch(
           WHERE id = $1
           `,
           [dispute.payment_id],
+        );
+
+        await createRiskAuditLog(
+          {
+            userId: studentUserId,
+            actionType: RISK_AUDIT_ACTION.ESCROW_RELEASE_APPROVED,
+            reason: "DISPUTE_RELEASE_TO_STUDENT",
+            relatedPaymentId: dispute.payment_id,
+            adminId,
+          },
+          { client },
         );
       }
 
@@ -1133,6 +1285,32 @@ router.patch(
       );
 
       updatedDispute = updated.rows[0];
+      await createRiskAuditLog(
+        {
+          userId: dispute.payment_user_id,
+          actionType: RISK_AUDIT_ACTION.DISPUTE_RESOLVED,
+          reason: normalizedResolution,
+          relatedPaymentId: dispute.payment_id,
+          adminId,
+        },
+        { client },
+      );
+      if (
+        Number.isInteger(studentUserId) &&
+        studentUserId > 0 &&
+        studentUserId !== dispute.payment_user_id
+      ) {
+        await createRiskAuditLog(
+          {
+            userId: studentUserId,
+            actionType: RISK_AUDIT_ACTION.DISPUTE_RESOLVED,
+            reason: normalizedResolution,
+            relatedPaymentId: dispute.payment_id,
+            adminId,
+          },
+          { client },
+        );
+      }
       await client.query("COMMIT");
     } catch (err) {
       try {

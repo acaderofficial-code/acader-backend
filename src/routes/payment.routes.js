@@ -22,6 +22,10 @@ import {
   getUserRiskScore,
   getWalletRestriction,
 } from "../services/fraud/review_queue.js";
+import {
+  createRiskAuditLog,
+  RISK_AUDIT_ACTION,
+} from "../services/fraud/risk_audit.js";
 
 const router = express.Router();
 
@@ -192,6 +196,7 @@ router.patch(
   asyncHandler(async (req, res) => {
     const { status } = req.body;
     const id = parseInt(req.params.id, 10);
+    const adminId = Number(req.user.id);
 
     if (Number.isNaN(id)) {
       return res.status(400).json({ message: "Invalid payment id" });
@@ -293,6 +298,17 @@ router.patch(
       studentUserId = parsedStudentUserId;
       const restriction = await getWalletRestriction(studentUserId);
       if (restriction) {
+        try {
+          await createRiskAuditLog({
+            userId: studentUserId,
+            actionType: RISK_AUDIT_ACTION.ESCROW_RELEASE_REJECTED,
+            reason: "STUDENT_RESTRICTED",
+            relatedPaymentId: id,
+            adminId,
+          });
+        } catch (auditErr) {
+          console.error("[risk_audit] release rejection log failed", auditErr.message);
+        }
         return res.status(409).json({
           message: "Student account restricted due to financial risk.",
         });
@@ -353,6 +369,14 @@ router.patch(
 
     if (status === "released") {
       const recipientUserId = studentUserId ?? updatedPayment.user_id;
+      await createRiskAuditLog({
+        userId: recipientUserId,
+        actionType: RISK_AUDIT_ACTION.ESCROW_RELEASE_APPROVED,
+        reason: "ADMIN_RELEASE",
+        relatedPaymentId: id,
+        adminId,
+      });
+
       await safeNotify(
         recipientUserId,
         "payment_released",
@@ -708,6 +732,33 @@ router.post(
         },
         { client },
       );
+
+      await createRiskAuditLog(
+        {
+          userId: pay.user_id,
+          actionType: RISK_AUDIT_ACTION.DISPUTE_OPENED,
+          reason: "PAYMENT_DISPUTE_OPENED",
+          riskScore,
+          relatedPaymentId: id,
+        },
+        { client },
+      );
+      const parsedStudentUserId = Number(pay.student_user_id);
+      if (
+        Number.isInteger(parsedStudentUserId) &&
+        parsedStudentUserId > 0 &&
+        parsedStudentUserId !== pay.user_id
+      ) {
+        await createRiskAuditLog(
+          {
+            userId: parsedStudentUserId,
+            actionType: RISK_AUDIT_ACTION.DISPUTE_OPENED,
+            reason: "PAYMENT_DISPUTE_OPENED",
+            relatedPaymentId: id,
+          },
+          { client },
+        );
+      }
 
       await client.query(
         `INSERT INTO notifications (user_id, type, message, related_id)

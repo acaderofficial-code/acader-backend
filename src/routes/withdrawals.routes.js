@@ -22,6 +22,10 @@ import {
   getUserRiskScore,
   getWalletRestriction,
 } from "../services/fraud/review_queue.js";
+import {
+  createRiskAuditLog,
+  RISK_AUDIT_ACTION,
+} from "../services/fraud/risk_audit.js";
 
 const router = express.Router();
 const FRAUD_BLOCK_THRESHOLD = 60;
@@ -106,6 +110,15 @@ router.post(
       const restriction = await getWalletRestriction(user_id, { client });
       if (restriction) {
         await client.query("ROLLBACK");
+        try {
+          await createRiskAuditLog({
+            userId: user_id,
+            actionType: RISK_AUDIT_ACTION.WITHDRAWAL_BLOCKED,
+            reason: "ACCOUNT_RESTRICTED",
+          });
+        } catch (auditErr) {
+          console.error("[risk_audit] withdrawal restricted log failed", auditErr.message);
+        }
         return res.status(403).json({
           message: "Account restricted due to financial risk.",
         });
@@ -114,6 +127,18 @@ router.post(
       const pendingReview = await getPendingFraudReviewForUser(user_id, { client });
       if (pendingReview) {
         await client.query("ROLLBACK");
+        try {
+          await createRiskAuditLog({
+            userId: user_id,
+            actionType: RISK_AUDIT_ACTION.WITHDRAWAL_BLOCKED,
+            reason: "PENDING_REVIEW",
+            riskScore: pendingReview.risk_score ?? null,
+            relatedPaymentId: pendingReview.payment_id ?? null,
+            relatedWithdrawalId: pendingReview.withdrawal_id ?? null,
+          });
+        } catch (auditErr) {
+          console.error("[risk_audit] pending review block log failed", auditErr.message);
+        }
         return res.status(409).json({
           message: "Withdrawal pending admin review.",
           review_id: pendingReview.id,
@@ -151,6 +176,27 @@ router.post(
         await notifyAdminsOfFraud(
           client,
           `User ${user_id} withdrawal blocked due to active dispute (review ${review?.id ?? "pending"})`,
+        );
+
+        await createRiskAuditLog(
+          {
+            userId: user_id,
+            actionType: RISK_AUDIT_ACTION.RULE_FLAG,
+            reason: "ACTIVE_DISPUTE",
+            riskScore,
+            relatedPaymentId: blockedPaymentId,
+          },
+          { client },
+        );
+        await createRiskAuditLog(
+          {
+            userId: user_id,
+            actionType: RISK_AUDIT_ACTION.WITHDRAWAL_BLOCKED,
+            reason: "PENDING_REVIEW",
+            riskScore,
+            relatedPaymentId: blockedPaymentId,
+          },
+          { client },
         );
 
         await client.query("COMMIT");
@@ -215,6 +261,27 @@ router.post(
           `User ${user_id} withdrawal blocked by behavioural risk model (review ${review?.id ?? "pending"})`,
         );
 
+        await createRiskAuditLog(
+          {
+            userId: user_id,
+            actionType: RISK_AUDIT_ACTION.AI_FLAG,
+            reason: "HIGH_RISK_SCORE",
+            riskScore: behaviouralScore,
+            relatedWithdrawalId: reviewWithdrawal.id,
+          },
+          { client },
+        );
+        await createRiskAuditLog(
+          {
+            userId: user_id,
+            actionType: RISK_AUDIT_ACTION.WITHDRAWAL_BLOCKED,
+            reason: "PENDING_REVIEW",
+            riskScore: behaviouralScore,
+            relatedWithdrawalId: reviewWithdrawal.id,
+          },
+          { client },
+        );
+
         console.error(`🚨 Fraud Risk Triggered for userId ${user_id}`);
         console.error("Rules:");
         console.error(["AI_RISK_THRESHOLD_EXCEEDED"]);
@@ -273,6 +340,27 @@ router.post(
         await notifyAdminsOfFraud(
           client,
           `User ${user_id} withdrawal flagged by fraud engine (review ${review?.id ?? "pending"})`,
+        );
+
+        await createRiskAuditLog(
+          {
+            userId: user_id,
+            actionType: RISK_AUDIT_ACTION.RULE_FLAG,
+            reason: rulesText || "RULE_ENGINE_FLAG",
+            riskScore: risk.riskScore,
+            relatedWithdrawalId: reviewWithdrawal.id,
+          },
+          { client },
+        );
+        await createRiskAuditLog(
+          {
+            userId: user_id,
+            actionType: RISK_AUDIT_ACTION.WITHDRAWAL_BLOCKED,
+            reason: "PENDING_REVIEW",
+            riskScore: risk.riskScore,
+            relatedWithdrawalId: reviewWithdrawal.id,
+          },
+          { client },
         );
 
         console.error(`🚨 Fraud Risk Triggered for userId ${user_id}`);

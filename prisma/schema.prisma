@@ -138,3 +138,17 @@ model WalletRestriction {
 
   @@map("wallet_restrictions")
 }
+
+model RiskAuditLog {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId             Int      @map("user_id")
+  actionType         String   @map("action_type")
+  reason             String?
+  riskScore          Int?     @map("risk_score")
+  relatedPaymentId   Int?     @map("related_payment_id")
+  relatedWithdrawalId Int?    @map("related_withdrawal_id")
+  adminId            Int?     @map("admin_id")
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  @@map("risk_audit_logs")
+}
